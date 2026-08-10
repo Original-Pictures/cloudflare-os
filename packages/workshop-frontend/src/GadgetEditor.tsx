@@ -1482,6 +1482,7 @@ export default function GadgetEditor() {
               <div className={layoutModeReady ? 'h-full' : 'h-full invisible'}>
                 <ChatInterface
                   key={id}
+                  workspaceId={id}
                   overseer={overseer.stub}
                   selectedChatId={effectiveSelectedChatId}
                   onNavigateToChat={navigateToChat}
