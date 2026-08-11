@@ -531,6 +531,19 @@ You were started programmatically by the Gadget to perform a task. The specific 
 Typically (but not always), you will need to use the \`executeCode\` tool to complete the task, invoking the available bindings (members of the env object) and other APIs available to you.
 `.trim();
 
+// Wrap a spawner's per-agent instructions (AgentSpawnerConfig.systemPrompt) in a clearly-delimited
+// block for the spawned agent's system prompt, or "" when unset. Mirrors formatInstanceInstructions;
+// callers separate it from the preceding prompt with a blank line.
+export function formatSpawnerInstructions(instructions: string | undefined): string {
+  let trimmed = (instructions ?? "").trim();
+  if (!trimmed) return "";
+  return `# Agent-specific instructions\n\n` +
+      `This agent has been configured with the following standing instructions. Follow them for ` +
+      `every task you are given, in addition to the specific task described in the first message, ` +
+      `unless they conflict with the user's safety or the instructions above.\n\n` +
+      `<agent_instructions>\n${trimmed}\n</agent_instructions>`;
+}
+
 let READ_FILE_TOOL_DESCRIPTION = `
 Read the content of a file owned by one of the workspace's gadgets. Note that you will be informed any time a file changes, so it is not necessary to read a file again after you have already read it once. This cannot read chat attachments; attachments are provided directly in the conversation.
 `.trim();
@@ -2081,11 +2094,16 @@ export async function runAgent(
           `You have access to the following bindings via the \`env\` object:\n${lines.join("\n")}`;
     }
 
-    // Split the system prompt into static and dynamic parts for better caching.
+    // Split the system prompt into static and dynamic parts for better caching. Slot 0 is the
+    // cache-stable prefix: kernel base prompt, then deployment-wide admin instructions, then this
+    // spawner's own agent-specific instructions (its persona). All three are static for a given
+    // spawner, so the prefix stays byte-stable across turns for prompt caching.
+    let spawnerInstructions = formatSpawnerInstructions(agentContext.spawnerConfig.systemPrompt);
+    let staticSlot = SPAWNER_SYSTEM_PROMPT;
+    if (instanceInstructions) staticSlot += `\n\n${instanceInstructions}`;
+    if (spawnerInstructions) staticSlot += `\n\n${spawnerInstructions}`;
     systemPromptSlots = [
-      instanceInstructions
-          ? `${SPAWNER_SYSTEM_PROMPT}\n\n${instanceInstructions}`
-          : SPAWNER_SYSTEM_PROMPT,
+      staticSlot,
       alwaysAvailableResourcesPrompt
           ? `${systemPromptBindings}\n\n${alwaysAvailableResourcesPrompt}`
           : systemPromptBindings,

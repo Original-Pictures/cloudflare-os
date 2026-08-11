@@ -1,6 +1,6 @@
 import { Checkbox, Select, type PortalContainer } from '@cloudflare/kumo'
 import { AiChatAuthorInfo, WorkpieceId, validateBindingName } from '@gadgets/workshop-shared/api'
-import { WorkshopInput } from '../components/WorkshopControls'
+import { WorkshopInput, WorkshopInputArea } from '../components/WorkshopControls'
 import { ConnectionConfigField } from './ConnectionConfigField'
 
 // One prospective entry of AgentSpawnerConfig.env: a workpiece the spawned agents may use, and
@@ -53,10 +53,12 @@ export interface AgentSpawnerConfigFormProps {
   availableModels: AiChatAuthorInfo[]
   displayName: string
   modelId: string | null
+  systemPrompt: string
   env: SpawnerEnvRow[]
   envError: string | null
   onDisplayNameChange: (value: string) => void
   onModelIdChange: (id: string | null) => void
+  onSystemPromptChange: (value: string) => void
   onEnvChange: (env: SpawnerEnvRow[]) => void
   selectContainer?: PortalContainer
 }
@@ -65,10 +67,12 @@ export function AgentSpawnerConfigForm({
   availableModels,
   displayName,
   modelId,
+  systemPrompt,
   env,
   envError,
   onDisplayNameChange,
   onModelIdChange,
+  onSystemPromptChange,
   onEnvChange,
   selectContainer,
 }: AgentSpawnerConfigFormProps) {
@@ -119,6 +123,20 @@ export function AgentSpawnerConfigForm({
         <p className="mt-1 text-[12px] leading-4 font-normal tracking-[-0.2px] text-kumo-subtle">
           Choose "None" to create conversations without an agent.
         </p>
+      </ConnectionConfigField>
+
+      <ConnectionConfigField
+        label="Instructions"
+        description="Standing instructions this agent follows on every run — its role, tone, and rules. Optional."
+      >
+        <WorkshopInputArea
+          aria-label="Agent instructions"
+          placeholder="e.g. You are a support triage agent. Summarize each incoming issue, classify its severity, and never promise a delivery date."
+          value={systemPrompt}
+          onChange={(e) => onSystemPromptChange(e.target.value)}
+          rows={4}
+          className="w-full"
+        />
       </ConnectionConfigField>
 
       <ConnectionConfigField

@@ -207,6 +207,7 @@ export default function GatekeeperModal({
 
   const [spawnerDisplayName, setSpawnerDisplayName] = useState('')
   const [spawnerModelId, setSpawnerModelId] = useState<string | null>(null)
+  const [spawnerSystemPrompt, setSpawnerSystemPrompt] = useState('')
   const [spawnerEnv, setSpawnerEnv] = useState<SpawnerEnvRow[]>([])
   const spawnerEnvError = validateSpawnerEnv(spawnerEnv)
 
@@ -365,6 +366,7 @@ export default function GatekeeperModal({
     setSelectedModelId(undefined)
     setSpawnerDisplayName('')
     setSpawnerModelId(null)
+    setSpawnerSystemPrompt('')
     setSpawnerEnv(
       (spawnerEnvCandidatesRef.current ?? []).map(entry => ({ ...entry, enabled: true })))
 
@@ -701,6 +703,7 @@ export default function GatekeeperModal({
       displayName: spawnerDisplayName.trim(),
       modelId: spawnerModelId,
       env: spawnerEnvFromRows(spawnerEnv),
+      ...(spawnerSystemPrompt.trim() ? { systemPrompt: spawnerSystemPrompt.trim() } : {}),
     }
 
     setCreating(true)
@@ -885,10 +888,12 @@ export default function GatekeeperModal({
                     availableModels={availableModels}
                     displayName={spawnerDisplayName}
                     modelId={spawnerModelId}
+                    systemPrompt={spawnerSystemPrompt}
                     env={spawnerEnv}
                     envError={spawnerEnvError}
                     onDisplayNameChange={setSpawnerDisplayName}
                     onModelIdChange={setSpawnerModelId}
+                    onSystemPromptChange={setSpawnerSystemPrompt}
                     onEnvChange={setSpawnerEnv}
                     selectContainer={selectPortalContainer}
                   />

@@ -666,6 +666,9 @@ export type GatekeeperVendorInfo = {
 // Maximum length (characters) of the admin-authored agent system-prompt instructions.
 export const MAX_INSTANCE_INSTRUCTIONS_LENGTH = 8000;
 
+// Maximum length (characters) of a spawner's per-agent instructions (AgentSpawnerConfig.systemPrompt).
+export const MAX_SPAWNER_INSTRUCTIONS_LENGTH = 8000;
+
 // Maximum length (characters) of the admin-authored site name shown next to the top-bar logo.
 export const MAX_SITE_NAME_LENGTH = 40;
 
@@ -1285,6 +1288,13 @@ export type AgentSpawnerConfig = {
   // The entries are deliberately not limited to bindings held by the gadget that owns the
   // spawner: a spawner may define bindings of its own, with its own names and targets.
   env: Record<string, WorkpieceId>,
+
+  // Optional agent-specific instructions (a persona / role / standing rules) layered into every
+  // spawned agent's system prompt, after the kernel base prompt and any deployment-wide admin
+  // instructions. This is what turns a spawner into a specialized agent: standing behavior that
+  // applies to every run, distinct from the per-invocation task carried in the first message.
+  // Capped at MAX_SPAWNER_INSTRUCTIONS_LENGTH; omit or pass "" for none.
+  systemPrompt?: string,
 };
 
 // Interface to a workspace's Overseer, used to display the Gadget Workshop shell UI around that
