@@ -616,8 +616,11 @@ export class UserAccount extends DurableObject<Env> {
     await this.#updateCredentials(async () => {
       let cached = this.ctx.storage.kv.get<SlackAccessToken>("accessToken");
       let refreshToken = this.ctx.storage.kv.get<string>("refreshToken");
-      if (refreshToken) await revokeToken(refreshToken);
-      if (cached) await revokeToken(cached.token);
+      // Remote revocation is best-effort: an already-expired or revoked token makes Slack's
+      // auth.revoke return an auth error, and that must not abort local teardown — otherwise the
+      // account can never be disconnected once its token dies.
+      if (refreshToken) await revokeToken(refreshToken).catch(() => {});
+      if (cached) await revokeToken(cached.token).catch(() => {});
       this.ctx.storage.deleteAlarm();
       this.ctx.storage.deleteAll();
     });
