@@ -96,6 +96,27 @@ export type SlackWorkspaceInfo = {
   domain: string;
 };
 
+/** An inbound event delivered to a workspace hook (see `SlackWorkspaceSession.subscribe`). */
+export type SlackInboundEvent = {
+  /** What triggered the event. */
+  kind: "app_mention" | "direct_message" | "slash_command";
+  /** The workspace (team) the event came from. */
+  teamId: string;
+  /** The channel, DM, or group DM the event occurred in. */
+  channelId: string;
+  /** The Slack user who triggered it, when known. */
+  userId?: string;
+  /** The message text, or the text following a slash command. Leading bot @mention is left intact. */
+  text: string;
+  /** The triggering message's timestamp/ID. Absent for slash commands. */
+  ts?: string;
+  /** The thread to reply into: the thread root `ts` when the event is inside a thread, otherwise the
+   *  message's own `ts`. Pass an event straight to `postReply` to answer in the right place. */
+  threadTs?: string;
+  /** For a slash command, the command name including its leading slash (e.g. "/titan"). */
+  command?: string;
+};
+
 // ── Cursor entry types ──────────────────────────────────────────────
 // Entries returned by list/search methods bundle metadata together with a capability for the
 // resource, so you can act on it directly without a separate lookup.
@@ -144,6 +165,32 @@ export interface SlackWorkspaceSession {
    *  "from:@bob in:#engineering budget"). The query must be non-empty and at most 1,000 UTF-8
    *  bytes. */
   search(query: string): Promise<Cursor<SlackMessageEntry>>;
+
+  /**
+   * Subscribe to inbound events for this workspace — app mentions, direct messages to the app, and
+   * slash commands. The user must approve the subscription before any events are delivered, and each
+   * delivered event is authorized as an observation. Requires the Slack app's Event Subscriptions
+   * (and any slash command) to point at this gatekeeper's `/events` request URL, and the app to be
+   * installed with a bot token.
+   *
+   * @param callback - A persistent stub (must be created with `ctx.restore()`) implementing
+   *   `SlackEventHook`; it is called once for each inbound event.
+   */
+  subscribe(callback: RpcStub<SlackEventHook>): Promise<void>;
+
+  /** Post a reply back to Slack as the connected app, answering an inbound event (its channel and
+   *  thread are reused). This is a write: it is queued for the user's approval before it is sent. */
+  postReply(event: SlackInboundEvent, text: string): Promise<void>;
+}
+
+/**
+ * Callback interface for inbound Slack events. Implement it and register it with
+ * `SlackWorkspaceSession.subscribe()`; the platform delivers each app mention, direct message, and
+ * slash command to `onEvent()`. Respond with `SlackWorkspaceSession.postReply()`.
+ */
+export interface SlackEventHook {
+  /** Called once per inbound event. */
+  onEvent(event: SlackInboundEvent): Promise<void>;
 }
 
 /**

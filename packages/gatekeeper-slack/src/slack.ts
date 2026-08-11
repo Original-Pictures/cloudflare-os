@@ -4,15 +4,17 @@ import {
   GatekeeperUser, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription,
   ApprovalQueue, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions,
   AccountDescription, SupportedResource, ResourceConfiguratorFrame, ActionKind, Cursor,
-  GatekeeperUserVerifier, ObservationDescription,
+  GatekeeperUserVerifier, ObservationDescription, ActionDescription,
+  HookController, HookInitiator, HookTargetMetadata,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
   SlackApi, SlackApiError, SlackAccessToken, SlackConversationTypeFilter, exchangeAuthCode,
-  refreshAccessToken, revokeToken,
+  refreshAccessToken, revokeToken, postSlackMessage,
 } from "./slack-api";
 import {
   SlackConversation, SlackConversationEntry, SlackConversationInfo, SlackMessage,
   SlackMessageEntry, SlackThread, SlackUser, SlackWorkspaceInfo, SlackWorkspaceSession,
+  SlackInboundEvent, SlackEventHook,
 } from "./types";
 import {
   ConversationConfiguratorUI, ThreadConfiguratorUI, WorkspaceConfiguratorUI,
@@ -56,6 +58,9 @@ function constantTimeEqual(a: string, b: string): boolean {
 type Env = Cloudflare.Env & {
   // Public worker URL without a trailing slash; defaults to the local dev route.
   BASE_URL?: string;
+  // Slack app "Signing Secret" (a Wrangler secret). Required to accept inbound Events API and
+  // slash-command requests at /events and /commands; when unset those endpoints reject everything.
+  SLACK_SIGNING_SECRET?: string;
 };
 
 function getBaseUrl(env: Env) {
@@ -210,7 +215,71 @@ const NOT_CONFIGURED_HTML = `<!DOCTYPE html>
   </body>
 </html>`;
 
-// ── HTTP handler: OAuth initiation + completion ─────────────────────
+// ── Inbound events: bot scopes + request verification ──────────────
+
+// Bot-token scopes requested alongside the user scopes. These let the app receive Events API
+// callbacks (app mentions and DMs), run a slash command, and post replies. Requesting them makes
+// the OAuth install create a bot user and return a bot token (see exchangeAuthCode).
+const BOT_SCOPES = [
+  "app_mentions:read",
+  "chat:write",
+  "commands",
+  "im:history",
+  "im:read",
+];
+
+// Reject requests older than this to blunt replay of a captured signed request.
+const SLACK_REQUEST_MAX_AGE_S = 60 * 5;
+
+// Verify Slack's request signature (https://api.slack.com/authentication/verifying-requests-from-slack)
+// over the exact raw body. Returns false when the signing secret is unset, so /events and /commands
+// fail closed until SLACK_SIGNING_SECRET is configured.
+async function verifySlackSignature(env: Env, req: Request, rawBody: string): Promise<boolean> {
+  let secret = env.SLACK_SIGNING_SECRET;
+  if (!secret) return false;
+  let timestamp = req.headers.get("x-slack-request-timestamp");
+  let signature = req.headers.get("x-slack-signature");
+  if (!timestamp || !signature) return false;
+  let age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (!Number.isFinite(age) || age > SLACK_REQUEST_MAX_AGE_S) return false;
+
+  let encoder = new TextEncoder();
+  let key = await crypto.subtle.importKey(
+      "raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  let mac = await crypto.subtle.sign("HMAC", key, encoder.encode(`v0:${timestamp}:${rawBody}`));
+  let expected = `v0=${hexEncode(new Uint8Array(mac))}`;
+  return constantTimeEqual(expected, signature);
+}
+
+// Map a raw Slack Events API `event` object to our SlackInboundEvent, or null for events we don't
+// forward (bot-authored messages — which would loop — and message subtypes like edits/joins).
+function parseEventCallback(teamId: string, event: any): SlackInboundEvent | null {
+  if (!event || typeof event !== "object") return null;
+  // Never forward messages the app itself (or any bot) posted, or non-plain message subtypes.
+  if (event.bot_id || event.subtype) return null;
+  let base = {
+    teamId,
+    channelId: String(event.channel ?? ""),
+    userId: event.user ? String(event.user) : undefined,
+    text: String(event.text ?? ""),
+    ts: event.ts ? String(event.ts) : undefined,
+    threadTs: event.thread_ts ? String(event.thread_ts) : (event.ts ? String(event.ts) : undefined),
+  };
+  if (!base.channelId) return null;
+  if (event.type === "app_mention") return { kind: "app_mention", ...base };
+  if (event.type === "message" && event.channel_type === "im") {
+    return { kind: "direct_message", ...base };
+  }
+  return null;
+}
+
+// Deliver an inbound event to every hook subscribed for its workspace.
+async function deliverToTeam(ctx: ExecutionContext, teamId: string, event: SlackInboundEvent) {
+  let router = ctx.exports.SlackTeamRouter.get(ctx.exports.SlackTeamRouter.idFromName(teamId));
+  await router.deliver(event);
+}
+
+// ── HTTP handler: OAuth initiation + completion + inbound events ────
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext) {
@@ -242,6 +311,8 @@ export default {
       authUrl.searchParams.set("redirect_uri", getBaseUrl(env) + "/oauth");
       // User scopes produce the read-only user token needed for private channels and DMs.
       authUrl.searchParams.set("user_scope", begun.scopes.join(","));
+      // Bot scopes install a bot user and return a bot token, enabling inbound events and replies.
+      authUrl.searchParams.set("scope", BOT_SCOPES.join(","));
       authUrl.searchParams.set("state", `${doId}:${begun.oauthNonce}`);
       return Response.redirect(authUrl.toString(), 302);
     } else if (relPath === "/oauth") {
@@ -265,6 +336,48 @@ export default {
       }
       return new Response(SELF_CLOSING_HTML,
           { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    } else if (relPath === "/events" || relPath === "/commands") {
+      // Inbound Events API callbacks (JSON) and slash commands (form-encoded). Both are signed
+      // POSTs; verify the signature over the exact raw body before trusting anything.
+      if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+      let rawBody = await req.text();
+      if (!await verifySlackSignature(env, req, rawBody)) {
+        return new Response("Invalid signature", { status: 401 });
+      }
+
+      if (relPath === "/events") {
+        let payload: any;
+        try { payload = JSON.parse(rawBody); } catch { return new Response("Bad Request", { status: 400 }); }
+        // Slack's one-time endpoint verification handshake.
+        if (payload.type === "url_verification") {
+          return new Response(String(payload.challenge ?? ""),
+              { headers: { "Content-Type": "text/plain" } });
+        }
+        if (payload.type === "event_callback") {
+          let event = parseEventCallback(String(payload.team_id ?? ""), payload.event);
+          // Ack within Slack's 3s window; do delivery after responding so retries aren't triggered.
+          if (event) ctx.waitUntil(deliverToTeam(ctx, event.teamId, event));
+        }
+        return new Response(null, { status: 200 });
+      } else {
+        // Slash command: application/x-www-form-urlencoded.
+        let form = new URLSearchParams(rawBody);
+        let teamId = form.get("team_id") ?? "";
+        let channelId = form.get("channel_id") ?? "";
+        if (teamId && channelId) {
+          let event: SlackInboundEvent = {
+            kind: "slash_command",
+            teamId,
+            channelId,
+            userId: form.get("user_id") ?? undefined,
+            text: form.get("text") ?? "",
+            command: form.get("command") ?? undefined,
+          };
+          ctx.waitUntil(deliverToTeam(ctx, teamId, event));
+        }
+        // Empty 200 acks the command with no visible message; the agent replies via postReply.
+        return new Response(null, { status: 200 });
+      }
     } else {
       return new Response("Not Found", { status: 404 });
     }
@@ -405,6 +518,10 @@ export class UserAccount extends DurableObject<Env> {
       this.ctx.storage.kv.put<string>("userId", grant.userId);
       this.ctx.storage.kv.put<string>("teamId", grant.teamId);
       if (grant.teamName) this.ctx.storage.kv.put<string>("teamName", grant.teamName);
+      // Bot token + bot user ID, present when bot scopes were granted. Used for inbound events and
+      // for posting replies (see postSlackMessage). Bot tokens do not rotate, so store as-is.
+      if (grant.botToken) this.ctx.storage.kv.put<string>("botToken", grant.botToken);
+      if (grant.botUserId) this.ctx.storage.kv.put<string>("botUserId", grant.botUserId);
       this.ctx.storage.kv.delete("requestedScopes");
 
       let reconnecting = this.ctx.storage.kv.get<boolean>("reconnecting");
@@ -441,6 +558,12 @@ export class UserAccount extends DurableObject<Env> {
 
   async getTeamId(): Promise<string> {
     return this.ctx.storage.kv.get<string>("teamId") ?? "";
+  }
+
+  // The workspace bot token, for posting replies. Null when the account was connected without bot
+  // scopes (a read-only, user-token-only install).
+  async getBotToken(): Promise<string | null> {
+    return this.ctx.storage.kv.get<string>("botToken") ?? null;
   }
 
   // Refresh rotating tokens shortly before expiry.
@@ -832,6 +955,82 @@ class SlackCursor<T> extends RpcTarget implements Cursor<T> {
   }
 }
 
+// ── Inbound event hooks ─────────────────────────────────────────────
+
+// Intersection type: SlackEventHook for the delivery method, RpcTarget to satisfy the
+// HookController/HookInitiator generic constraint (Hook extends RpcTarget).
+type SlackEventHookTarget = RpcTarget & SlackEventHook;
+
+// A short label for an inbound event, used in the observation shown to the approver.
+function eventSummary(event: SlackInboundEvent): string {
+  let who = event.userId ? ` from ${event.userId}` : "";
+  if (event.kind === "slash_command") return `Slack command ${event.command ?? ""}${who}`;
+  if (event.kind === "direct_message") return `Slack direct message${who}`;
+  return `Slack mention${who}`;
+}
+
+// SlackTeamRouter DO: one per Slack workspace (team), keyed by team ID via idFromName. Stores the
+// HookInitiator for every workspace binding that has subscribed, and fans an inbound event out to
+// each. Initiators are persistent stubs (see bindHook docs), stored under "hook:<subId>".
+export class SlackTeamRouter extends DurableObject<Env> {
+  async setHook(subId: string, initiator: Fetcher<HookInitiator<SlackEventHookTarget>>): Promise<void> {
+    this.ctx.storage.kv.put(`hook:${subId}`, initiator);
+  }
+
+  async clearHook(subId: string): Promise<void> {
+    this.ctx.storage.kv.delete(`hook:${subId}`);
+  }
+
+  async deliver(event: SlackInboundEvent): Promise<void> {
+    let entries = [...this.ctx.storage.kv.list<Fetcher<HookInitiator<SlackEventHookTarget>>>(
+        { prefix: "hook:" })];
+    // Deliver to every subscribed hook independently; one failing hook must not block the others.
+    await Promise.allSettled(entries.map(async ([, initiator]) => {
+      // @ts-ignore TODO: TS doesn't model the returned promise as disposable (see gatekeeper-email).
+      using startHookResult = initiator.startHook();
+      await startHookResult.approvalQueue.authorizeObservation({
+        title: eventSummary(event),
+        description:
+            `Received a Slack ${event.kind.replace("_", " ")}` +
+            (event.userId ? ` from user ${event.userId}` : "") +
+            ` in channel ${event.channelId}.\n\n` +
+            (event.command ? `**Command:** ${event.command}\n` : "") +
+            `**Text:** ${truncate(event.text, 500)}`,
+      });
+      await startHookResult.callback.onEvent(event);
+    }));
+  }
+}
+
+// Registered with the overseer when a workspace session subscribes. The overseer calls enable()
+// once the user approves the hook, at which point we record the initiator in the team router.
+@validateRpc()
+export class SlackEventHookControllerImpl
+    extends WorkerEntrypoint<Env, { teamId: string; subId: string }>
+    implements HookController<SlackEventHookTarget> {
+  async enable(initiator: Fetcher<HookInitiator<SlackEventHookTarget>>,
+               _target: HookTargetMetadata): Promise<void> {
+    await this.#router().setHook(this.ctx.props.subId, initiator);
+  }
+
+  async disable(): Promise<void> {
+    await this.#router().clearHook(this.ctx.props.subId);
+  }
+
+  #router(): DurableObjectStub<SlackTeamRouter> {
+    return this.ctx.exports.SlackTeamRouter.get(
+        this.ctx.exports.SlackTeamRouter.idFromName(this.ctx.props.teamId));
+  }
+}
+
+// A reply queued by SlackWorkspaceSession.postReply, awaiting the user's approval. Stored in the
+// workspace gatekeeper DO keyed by its action ID until applyAction sends it or rejectAction drops it.
+type PendingReply = {
+  channelId: string;
+  text: string;
+  threadTs?: string;
+};
+
 // ── Gatekeeper impls ────────────────────────────────────────────────
 
 const NO_ACTIONS: ActionKind[] = [];
@@ -870,6 +1069,7 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
       snippet: `Slack workspace: ${info.name || info.teamId}`,
       suggestedBindingName: "SLACK_WORKSPACE",
       tsType: "SlackWorkspaceSession",
+      hookTsType: "SlackEventHook",
     };
   }
 
@@ -992,9 +1192,76 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
     this.ctx.storage.kv.delete(this.#observerKey(id));
   }
 
-  applyAction(): Promise<void> { return unreachableAction(); }
-  rejectAction(): Promise<void> { return unreachableAction(); }
-  revertAction(): Promise<void> { return unreachableAction(); }
+  // ── Inbound event subscription (called in-process by the workspace session) ──
+
+  // Register an inbound-event hook against the connected workspace. Mirrors gatekeeper-email: build
+  // a HookController whose props carry everything enable() needs, then bindHook() so the overseer
+  // stores the callback and enables it once the user approves. The subscription is keyed by this
+  // gatekeeper DO's ID, so re-subscribing from the same binding replaces the prior registration.
+  async bindEventHook(
+      approvalQueue: RpcStub<ApprovalQueue>, callback: RpcStub<SlackEventHookTarget>): Promise<void> {
+    let teamId = await this.#account().getTeamId();
+    if (!teamId) throw new Error("This Slack account has no associated workspace.");
+    let controller: Fetcher<HookController<SlackEventHookTarget>> =
+        this.ctx.exports.SlackEventHookControllerImpl({
+          props: { teamId, subId: this.ctx.id.toString() },
+        });
+    // @ts-ignore TS mismatches the Fetcher<HookController> shape (see gatekeeper-email).
+    await approvalQueue.bindHook(controller, callback, {
+      title: "Receive Slack events",
+      description:
+          "Receive app mentions, direct messages, and slash commands from the connected Slack " +
+          "workspace, and let this workspace reply to them.",
+    });
+  }
+
+  // ── Reply action (called in-process by the workspace session) ──
+
+  #nextActionId(): number {
+    let id = this.ctx.storage.kv.get<number>("nextActionId") ?? 1;
+    this.ctx.storage.kv.put<number>("nextActionId", id + 1);
+    return id;
+  }
+
+  // Queue a reply for approval. The post is not sent until the overseer calls applyAction().
+  async submitPostReply(
+      approvalQueue: RpcStub<ApprovalQueue>, reply: PendingReply): Promise<void> {
+    let id = this.#nextActionId();
+    this.ctx.storage.kv.put<PendingReply>(`action:${id}`, reply);
+    let description: ActionDescription = {
+      title: `Post to Slack channel ${reply.channelId}`,
+      description:
+          `Post the following message to Slack channel ${reply.channelId}` +
+          (reply.threadTs ? ` (in thread ${reply.threadTs})` : "") + `:\n\n${reply.text}`,
+      // chat.postMessage is not simulated and cannot be cleanly un-posted, so require a decision
+      // before the agent continues, and do not advertise revert.
+      implementsRevert: false,
+      awaitDecision: true,
+    };
+    await approvalQueue.submitAction(id, description);
+  }
+
+  async applyAction(action: number): Promise<void> {
+    let reply = this.ctx.storage.kv.get<PendingReply>(`action:${action}`);
+    if (!reply) throw new Error(`Unknown Slack action ${action}`);
+    let botToken = await this.#account().getBotToken();
+    if (!botToken) {
+      throw new Error(
+          "This Slack workspace was connected without a bot token, so it cannot post messages. " +
+          "Reconnect the account to grant the bot scopes.");
+    }
+    await postSlackMessage(botToken, reply.channelId, reply.text, reply.threadTs);
+    this.ctx.storage.kv.delete(`action:${action}`);
+  }
+
+  async rejectAction(action: number): Promise<void> {
+    this.ctx.storage.kv.delete(`action:${action}`);
+  }
+
+  async revertAction(action: number):
+      Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
+    return { message: "A posted Slack message cannot be un-posted automatically; delete it in Slack." };
+  }
 }
 
 type SlackConversationGatekeeperImplProps = {
@@ -1229,6 +1496,26 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
       });
       let entries = page.items.map(match => messageEntry(ctx, match.channelId, match.message));
       return { items: entries, nextCursor: page.nextCursor };
+    });
+  }
+
+  async subscribe(callback: RpcStub<SlackEventHookTarget>): Promise<void> {
+    if (!this.#ctx.tracker) {
+      throw new Error("Slack event subscriptions are only available on a workspace binding.");
+    }
+    await this.#ctx.tracker.bindEventHook(this.#ctx.approvalQueue, callback);
+  }
+
+  async postReply(event: SlackInboundEvent, text: string): Promise<void> {
+    if (!this.#ctx.tracker) {
+      throw new Error("Posting to Slack is only available on a workspace binding.");
+    }
+    if (!text.trim()) throw new Error("Reply text must not be empty.");
+    if (!event.channelId) throw new Error("The event has no channel to reply to.");
+    await this.#ctx.tracker.submitPostReply(this.#ctx.approvalQueue, {
+      channelId: event.channelId,
+      text,
+      threadTs: event.threadTs,
     });
   }
 }

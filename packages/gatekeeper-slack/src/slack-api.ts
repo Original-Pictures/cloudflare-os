@@ -30,6 +30,11 @@ export type SlackOAuthGrant = {
   userId: string;
   teamId: string;
   teamName?: string;
+  // The workspace-level bot token (xoxb...) and the app's bot user ID, present only when the app
+  // requested bot scopes via the top-level `scope` parameter. Needed to receive Events API
+  // callbacks and to post replies. Absent for a user-scope-only (read-only) connection.
+  botToken?: string;
+  botUserId?: string;
 };
 
 /** The result of refreshing a rotating token. */
@@ -149,7 +154,26 @@ export async function exchangeAuthCode(
     userId: authedUser.id,
     teamId: data.team?.id ?? "",
     teamName: data.team?.name,
+    // The bot token and bot user ID sit at the top level of the response, alongside authed_user.
+    botToken: typeof data.access_token === "string" ? data.access_token : undefined,
+    botUserId: typeof data.bot_user_id === "string" ? data.bot_user_id : undefined,
   };
+}
+
+// Post a message to a conversation using a workspace bot token (xoxb...). Used to deliver agent
+// replies back to Slack. `threadTs` replies within a thread when provided.
+export async function postSlackMessage(
+    botToken: string, channel: string, text: string, threadTs?: string): Promise<void> {
+  let response = await fetch(`${SLACK_API_BASE}/chat.postMessage`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${botToken}`,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify({ channel, text, ...(threadTs ? { thread_ts: threadTs } : {}) }),
+  });
+  let data = await response.json<SlackApiEnvelope>();
+  if (!data.ok) throw slackApiError(data.error, response.status);
 }
 
 /** Refreshes a rotating user token, returning null when reauthorization is required. */

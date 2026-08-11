@@ -8,7 +8,7 @@ interface __BaseEnv_Env {
 declare namespace Cloudflare {
 	interface GlobalProps {
 		mainModule: typeof import("./src/slack");
-		durableNamespaces: "UserAccount" | "SlackWorkspaceGatekeeperImpl" | "SlackConversationGatekeeperImpl" | "SlackThreadGatekeeperImpl";
+		durableNamespaces: "UserAccount" | "SlackWorkspaceGatekeeperImpl" | "SlackConversationGatekeeperImpl" | "SlackThreadGatekeeperImpl" | "SlackTeamRouter";
 	}
 	interface Env extends __BaseEnv_Env {}
 }

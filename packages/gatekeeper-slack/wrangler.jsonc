@@ -19,6 +19,12 @@
         "SlackConversationGatekeeperImpl",
         "SlackThreadGatekeeperImpl"
       ]
+    },
+    {
+      // Routes inbound Slack events (Events API + slash commands) to subscribed workspace hooks,
+      // keyed by team ID. See SlackTeamRouter in src/slack.ts.
+      "tag": "v1",
+      "new_sqlite_classes": ["SlackTeamRouter"]
     }
   ]
 }
