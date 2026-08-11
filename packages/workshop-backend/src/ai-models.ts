@@ -231,6 +231,20 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
         ...window,
         compat: workersAiCompat(catalog),
       };
+    case "openrouter":
+      // OpenRouter exposes an OpenAI-compatible completions API. The AI Gateway path for OpenRouter
+      // is /openrouter/api/v1; pi's openai-completions impl appends /chat/completions.
+      return {
+        id: config.model,
+        name: catalog?.name ?? config.model,
+        api: "openai-completions",
+        provider: "openrouter",
+        baseUrl: `${gatewayUrl}/openrouter/api/v1`,
+        reasoning: false,
+        input: catalog?.input ?? ["text"],
+        cost: catalog?.cost ?? ZERO_COST,
+        ...window,
+      };
     default:
       return undefined;
   }
@@ -583,6 +597,22 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           ...window,
           thinkingLevelMap: catalog?.thinkingLevelMap,
           compat: catalog?.compat,
+        },
+        apiKey: config.apiToken,
+        sessionAffinity,
+      });
+    case "openrouter":
+      return makeHandle({
+        model: {
+          id: config.model,
+          name: catalog?.name ?? config.model,
+          api: "openai-completions",
+          provider: "openrouter",
+          baseUrl: config.apiUrl ?? "https://openrouter.ai/api/v1",
+          reasoning: false,
+          input: catalog?.input ?? ["text"],
+          cost: catalog?.cost ?? ZERO_COST,
+          ...window,
         },
         apiKey: config.apiToken,
         sessionAffinity,
