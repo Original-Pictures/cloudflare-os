@@ -6,6 +6,7 @@ import {
   AccountDescription, SupportedResource, ResourceConfiguratorFrame, ActionKind, Cursor,
   GatekeeperUserVerifier, ObservationDescription, ActionDescription,
   HookController, HookInitiator, HookTargetMetadata,
+  stripTrailingSlashes,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
   SlackApi, SlackApiError, SlackAccessToken, SlackConversationTypeFilter, exchangeAuthCode,
@@ -61,10 +62,13 @@ type Env = Cloudflare.Env & {
   // Slack app "Signing Secret" (a Wrangler secret). Required to accept inbound Events API and
   // slash-command requests at /events and /commands; when unset those endpoints reject everything.
   SLACK_SIGNING_SECRET?: string;
+  // OAuth app credentials (wrangler secrets / .dev.vars); not in wrangler.jsonc.
+  CLIENT_ID?: string;
+  CLIENT_SECRET?: string;
 };
 
 function getBaseUrl(env: Env) {
-  return (env.BASE_URL || "http://localhost:8787/gatekeeper/slack").replace(/\/+$/, "");
+  return stripTrailingSlashes(env.BASE_URL || "http://localhost:8787/gatekeeper/slack");
 }
 
 function getBasePath(env: Env) {
