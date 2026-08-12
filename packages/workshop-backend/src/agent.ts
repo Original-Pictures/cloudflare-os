@@ -511,14 +511,29 @@ class Greeter extends RpcTarget {
 
 Notice that the restore method is named using a symbol. This allows the system to access it, without making the method directly available over RPC.
 
-Once you have a Gadget with a restorer method, you can then call \`ctx.restore(params)\`. The given \`params\` (which must be serializable) will be passed to the Gadget's restorer, and the resulting persistent RpcStub will be returned to you:
+Once you have a Gadget with a restorer method, create the persistent callback in one of two ways.
+From an \`executeCode\` call, use the provided \`ctx.restore(params)\` directly:
 
 \`\`\`
 let greeter = await ctx.restore({type: "greeter", greeting: "Howdy"});
 env.SOME_BINDING.registerGreeter(greeter);
 \`\`\`
 
-In Gadget code, the \`ctx\` object is passed to the \`DurableObject\` constructor and is automatically available as \`this.ctx\` within the class. When writing code for the \`executeCode\` tool call, the \`ctx\` object is passed as a parameter to your function. You can call \`ctx.restore()\` from either location, though usually it's best to call it as part of \`executeCode\` as usually registering hooks is something you do one time, not programmatically.
+From a Gadget method, use the built-in \`this.env.GADGET_RUNTIME\` capability. A Gadget runs as a
+Durable Object facet, so its own \`this.ctx.restore()\` does not carry the supervisor restoration
+context and must not be used for persistent callbacks:
+
+\`\`\`
+let greeter = await this.env.GADGET_RUNTIME.createPersistentCallback({
+  type: "greeter",
+  greeting: "Howdy",
+});
+await this.env.SOME_BINDING.registerGreeter(greeter);
+\`\`\`
+
+Both forms bind the callback to the correct Gadget and pass the serializable params to its
+\`[restore]()\` method immediately and whenever the callback is restored later. Hook registration
+still goes through the integration's normal approval flow.
 `.trim();
 
 let SPAWNER_SYSTEM_PROMPT = `

@@ -14,9 +14,13 @@ import {
 } from "./slack-api";
 import {
   SlackConversation, SlackConversationEntry, SlackConversationInfo, SlackMessage,
-  SlackMessageEntry, SlackThread, SlackUser, SlackWorkspaceInfo, SlackWorkspaceSession,
-  SlackInboundEvent, SlackEventHook,
+  SlackFileDownload, SlackMessageEntry, SlackThread, SlackUser, SlackWorkspaceInfo, SlackWorkspaceSession,
+  SlackInboundEvent, SlackEventHook, SlackEventSubscriptionOptions,
 } from "./types";
+import {
+  LEGACY_SLACK_EVENT_KINDS, NormalizedSlackEventSubscription, normalizeEventSubscription,
+  parseEventCallback, subscriptionMatches,
+} from "./slack-events";
 import {
   ConversationConfiguratorUI, ThreadConfiguratorUI, WorkspaceConfiguratorUI,
 } from "./slack-configurators";
@@ -226,8 +230,10 @@ const NOT_CONFIGURED_HTML = `<!DOCTYPE html>
 // the OAuth install create a bot user and return a bot token (see exchangeAuthCode).
 const BOT_SCOPES = [
   "app_mentions:read",
+  "channels:history",
   "chat:write",
   "commands",
+  "files:read",
   "im:history",
   "im:read",
 ];
@@ -253,28 +259,6 @@ async function verifySlackSignature(env: Env, req: Request, rawBody: string): Pr
   let mac = await crypto.subtle.sign("HMAC", key, encoder.encode(`v0:${timestamp}:${rawBody}`));
   let expected = `v0=${hexEncode(new Uint8Array(mac))}`;
   return constantTimeEqual(expected, signature);
-}
-
-// Map a raw Slack Events API `event` object to our SlackInboundEvent, or null for events we don't
-// forward (bot-authored messages — which would loop — and message subtypes like edits/joins).
-function parseEventCallback(teamId: string, event: any): SlackInboundEvent | null {
-  if (!event || typeof event !== "object") return null;
-  // Never forward messages the app itself (or any bot) posted, or non-plain message subtypes.
-  if (event.bot_id || event.subtype) return null;
-  let base = {
-    teamId,
-    channelId: String(event.channel ?? ""),
-    userId: event.user ? String(event.user) : undefined,
-    text: String(event.text ?? ""),
-    ts: event.ts ? String(event.ts) : undefined,
-    threadTs: event.thread_ts ? String(event.thread_ts) : (event.ts ? String(event.ts) : undefined),
-  };
-  if (!base.channelId) return null;
-  if (event.type === "app_mention") return { kind: "app_mention", ...base };
-  if (event.type === "message" && event.channel_type === "im") {
-    return { kind: "direct_message", ...base };
-  }
-  return null;
 }
 
 // Deliver an inbound event to every hook subscribed for its workspace.
@@ -358,7 +342,10 @@ export default {
               { headers: { "Content-Type": "text/plain" } });
         }
         if (payload.type === "event_callback") {
-          let event = parseEventCallback(String(payload.team_id ?? ""), payload.event);
+          let event = parseEventCallback(
+              String(payload.team_id ?? ""),
+              payload.event_id ? String(payload.event_id) : undefined,
+              payload.event);
           // Ack within Slack's 3s window; do delivery after responding so retries aren't triggered.
           if (event) ctx.waitUntil(deliverToTeam(ctx, event.teamId, event));
         }
@@ -640,6 +627,19 @@ function createAccessTokenGetter(
       cached = await getStub().getAccessToken();
     }
     return cached.token;
+  };
+}
+
+function createBotTokenGetter(
+    getStub: () => DurableObjectStub<UserAccount>): () => Promise<string> {
+  let cached: string | undefined;
+  return async () => {
+    cached ??= await getStub().getBotToken() ?? undefined;
+    if (!cached) {
+      throw new Error(
+          "This Slack workspace was connected without a bot token. Reconnect it to read files.");
+    }
+    return cached;
   };
 }
 
@@ -973,6 +973,8 @@ function eventSummary(event: SlackInboundEvent): string {
   let who = event.userId ? ` from ${event.userId}` : "";
   if (event.kind === "slash_command") return `Slack command ${event.command ?? ""}${who}`;
   if (event.kind === "direct_message") return `Slack direct message${who}`;
+  if (event.kind === "channel_message") return `Slack channel message${who}`;
+  if (event.kind === "file_shared") return `Slack file shared${who}`;
   return `Slack mention${who}`;
 }
 
@@ -980,19 +982,35 @@ function eventSummary(event: SlackInboundEvent): string {
 // HookInitiator for every workspace binding that has subscribed, and fans an inbound event out to
 // each. Initiators are persistent stubs (see bindHook docs), stored under "hook:<subId>".
 export class SlackTeamRouter extends DurableObject<Env> {
-  async setHook(subId: string, initiator: Fetcher<HookInitiator<SlackEventHookTarget>>): Promise<void> {
-    this.ctx.storage.kv.put(`hook:${subId}`, initiator);
+  async setHook(
+      subId: string, initiator: Fetcher<HookInitiator<SlackEventHookTarget>>,
+      subscription: NormalizedSlackEventSubscription): Promise<void> {
+    this.ctx.storage.kv.delete(`hook:${subId}`);
+    this.ctx.storage.kv.put(`hook2:${subId}`, {initiator, subscription});
   }
 
   async clearHook(subId: string): Promise<void> {
     this.ctx.storage.kv.delete(`hook:${subId}`);
+    this.ctx.storage.kv.delete(`hook2:${subId}`);
   }
 
   async deliver(event: SlackInboundEvent): Promise<void> {
-    let entries = [...this.ctx.storage.kv.list<Fetcher<HookInitiator<SlackEventHookTarget>>>(
-        { prefix: "hook:" })];
+    // `hook:` entries predate filters and retain the old mentions/DMs/commands behavior. New
+    // records use `hook2:` so persisted capabilities can be upgraded without a storage migration.
+    let deliveries = [...this.ctx.storage.kv.list<Fetcher<HookInitiator<SlackEventHookTarget>>>(
+        { prefix: "hook:" })].map(([, initiator]) => ({
+          initiator,
+          subscription: {kinds: LEGACY_SLACK_EVENT_KINDS} as NormalizedSlackEventSubscription,
+        }));
+    for (let [, record] of this.ctx.storage.kv.list<{
+      initiator: Fetcher<HookInitiator<SlackEventHookTarget>>;
+      subscription: NormalizedSlackEventSubscription;
+    }>({prefix: "hook2:"})) {
+      deliveries.push(record);
+    }
     // Deliver to every subscribed hook independently; one failing hook must not block the others.
-    await Promise.allSettled(entries.map(async ([, initiator]) => {
+    await Promise.allSettled(deliveries.filter(({subscription}) =>
+      subscriptionMatches(subscription, event)).map(async ({initiator}) => {
       // @ts-ignore TODO: TS doesn't model the returned promise as disposable (see gatekeeper-email).
       using startHookResult = initiator.startHook();
       await startHookResult.approvalQueue.authorizeObservation({
@@ -1002,6 +1020,7 @@ export class SlackTeamRouter extends DurableObject<Env> {
             (event.userId ? ` from user ${event.userId}` : "") +
             ` in channel ${event.channelId}.\n\n` +
             (event.command ? `**Command:** ${event.command}\n` : "") +
+            (event.eventId ? `**Event ID:** ${event.eventId}\n` : "") +
             `**Text:** ${truncate(event.text, 500)}`,
       });
       await startHookResult.callback.onEvent(event);
@@ -1013,11 +1032,15 @@ export class SlackTeamRouter extends DurableObject<Env> {
 // once the user approves the hook, at which point we record the initiator in the team router.
 @validateRpc()
 export class SlackEventHookControllerImpl
-    extends WorkerEntrypoint<Env, { teamId: string; subId: string }>
+    extends WorkerEntrypoint<Env, {
+      teamId: string;
+      subId: string;
+      subscription: NormalizedSlackEventSubscription;
+    }>
     implements HookController<SlackEventHookTarget> {
   async enable(initiator: Fetcher<HookInitiator<SlackEventHookTarget>>,
                _target: HookTargetMetadata): Promise<void> {
-    await this.#router().setHook(this.ctx.props.subId, initiator);
+    await this.#router().setHook(this.ctx.props.subId, initiator, this.ctx.props.subscription);
   }
 
   async disable(): Promise<void> {
@@ -1066,6 +1089,7 @@ type TrackedConversationState = "pending" | "observed";
 export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorkspaceGatekeeperImplProps>
     implements Gatekeeper<SlackWorkspaceSession> {
   #apiInstance?: SlackApi;
+  #botApiInstance?: SlackApi;
 
   #account(): DurableObjectStub<UserAccount> {
     return this.ctx.exports.UserAccount.get(
@@ -1074,6 +1098,10 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
 
   #api(): SlackApi {
     return this.#apiInstance ??= new SlackApi(createAccessTokenGetter(() => this.#account()));
+  }
+
+  #botApi(): SlackApi {
+    return this.#botApiInstance ??= new SlackApi(createBotTokenGetter(() => this.#account()));
   }
 
   async describe(): Promise<ResourceDescription> {
@@ -1214,20 +1242,48 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
   // stores the callback and enables it once the user approves. The subscription is keyed by this
   // gatekeeper DO's ID, so re-subscribing from the same binding replaces the prior registration.
   async bindEventHook(
-      approvalQueue: RpcStub<ApprovalQueue>, callback: RpcStub<SlackEventHookTarget>): Promise<void> {
+      approvalQueue: RpcStub<ApprovalQueue>, callback: RpcStub<SlackEventHookTarget>,
+      options?: SlackEventSubscriptionOptions): Promise<void> {
     let teamId = await this.#account().getTeamId();
     if (!teamId) throw new Error("This Slack account has no associated workspace.");
+    let subscription = normalizeEventSubscription(options);
     let controller: Fetcher<HookController<SlackEventHookTarget>> =
         this.ctx.exports.SlackEventHookControllerImpl({
-          props: { teamId, subId: this.ctx.id.toString() },
+          props: { teamId, subId: this.ctx.id.toString(), subscription },
         });
+    let kinds = subscription.kinds.map(kind => kind.replace("_", " ")).join(", ");
+    let channels = subscription.channelIds?.join(", ");
+    if (subscription.channelIds) {
+      await this.authorizeConversationObservation(approvalQueue, subscription.channelIds, {
+        title: "Configure Slack channel event subscription",
+        description:
+            `Allow this workspace to receive matching events from: ${subscription.channelIds.join(", ")}.`,
+      });
+    }
     // @ts-ignore TS mismatches the Fetcher<HookController> shape (see gatekeeper-email).
     await approvalQueue.bindHook(controller, callback, {
       title: "Receive Slack events",
       description:
-          "Receive app mentions, direct messages, and slash commands from the connected Slack " +
-          "workspace, and let this workspace reply to them.",
+          `Receive these Slack events: ${kinds}.` +
+          (channels ? ` Only receive events from: ${channels}.` : "") +
+          " Let this workspace process and reply to matching events.",
     });
+  }
+
+  async downloadFile(
+      approvalQueue: RpcStub<ApprovalQueue>, conversationId: string,
+      fileId: string): Promise<SlackFileDownload> {
+    let api = this.#botApi();
+    let info = await api.getFileInfo(fileId);
+    if (!info.conversationIds.includes(conversationId)) {
+      throw new Error(`Slack file ${fileId} is not shared in conversation ${conversationId}.`);
+    }
+    await this.authorizeConversationObservation(approvalQueue, [conversationId], {
+      title: `Download Slack file ${info.file.name}`,
+      description:
+          `Download ${info.file.name} (${info.file.id}) from conversation ${conversationId}.`,
+    });
+    return {file: info.file, content: await api.downloadFileContent(info)};
   }
 
   // ── Reply action (called in-process by the workspace session) ──
@@ -1518,11 +1574,24 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
     });
   }
 
-  async subscribe(callback: RpcStub<SlackEventHookTarget>): Promise<void> {
+  async downloadFile(conversationId: string, fileId: string): Promise<SlackFileDownload> {
+    if (!this.#ctx.tracker) {
+      throw new Error("File downloads are only available on a workspace binding.");
+    }
+    if (!conversationId.trim() || !fileId.trim()) {
+      throw new Error("A Slack conversation ID and file ID are required.");
+    }
+    return this.#ctx.tracker.downloadFile(
+        this.#ctx.approvalQueue, conversationId, fileId);
+  }
+
+  async subscribe(
+      callback: RpcStub<SlackEventHookTarget>,
+      options?: SlackEventSubscriptionOptions): Promise<void> {
     if (!this.#ctx.tracker) {
       throw new Error("Slack event subscriptions are only available on a workspace binding.");
     }
-    await this.#ctx.tracker.bindEventHook(this.#ctx.approvalQueue, callback);
+    await this.#ctx.tracker.bindEventHook(this.#ctx.approvalQueue, callback, options);
   }
 
   async postReply(event: SlackInboundEvent, text: string): Promise<void> {

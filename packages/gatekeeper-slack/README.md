@@ -36,14 +36,20 @@ App configuration:
 For app mentions, DMs, and slash commands to reach a Gadget — and for `postReply` / `postMessage`
 to send — the app also needs **bot** scopes and Event Subscriptions:
 
-- **Bot Token Scopes**: `chat:write`, `app_mentions:read`, `commands`, `im:history`, `im:read`.
+- **Bot Token Scopes**: `chat:write`, `app_mentions:read`, `channels:history`, `commands`,
+  `files:read`, `im:history`, `im:read`.
 - **Event Subscriptions**: Request URL `<BASE_URL>/events`, subscribed to `app_mention` and
-  `message.im`. Optionally a slash command → `<BASE_URL>/commands`.
+  `message.im`. To build channel monitors, also subscribe to `message.channels` and `file_shared`;
+  those events are delivered only to hooks which explicitly request them. Optionally a slash
+  command → `<BASE_URL>/commands`.
 - **`SLACK_SIGNING_SECRET`** (a Wrangler secret, from *Basic Information → App Credentials*) **must
   be set on this Worker**, or `/events` and `/commands` fail closed (401) — Slack can't even verify
   the Request URL. Set it alongside `CLIENT_ID` / `CLIENT_SECRET`.
-- A Gadget receives events by calling `SlackWorkspaceSession.subscribe(callback)` where `callback`
-  is a **persistent stub created with `ctx.restore()`**; the user must then approve the hook.
+- A Gadget receives events by calling `SlackWorkspaceSession.subscribe(callback, options?)` where
+  `callback` is a persistent stub. Create it with `ctx.restore()` from `executeCode`, or with
+  `env.GADGET_RUNTIME.createPersistentCallback()` from Gadget code; the user must then approve the
+  hook. Use `options.kinds` and `options.channelIds` to filter ambient channel traffic before it
+  starts the Gadget.
 
 ## Resources
 

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { DEFAULT_ADMIN_CONFIG, serializeAdminConfig } from "../src/admin-config.js";
-import { OverseerDurableObject } from "../src/overseer.js";
+import { GadgetRuntimeLoopback, OverseerDurableObject } from "../src/overseer.js";
 
 vi.mock("capnweb-validate", () => ({ validateRpc: () => () => undefined }));
 
@@ -157,4 +157,27 @@ describe("hook target", () => {
     expect(controllerEnable.mock.calls[0][1]).toEqual({workspaceId: "workspace-id"});
   });
 
+});
+
+describe("GadgetRuntimeLoopback", () => {
+  it("seals callbacks for the exact Gadget carried by its capability props", async () => {
+    let createPersistentCallback = vi.fn(async () => ({persistent: true}));
+    let runtime = Object.create(GadgetRuntimeLoopback.prototype) as GadgetRuntimeLoopback;
+    Object.assign(runtime, {
+      ctx: {
+        props: {overseerId: "workspace-id", gadgetId: 17},
+        exports: {
+          OverseerDurableObject: {
+            idFromString: (id: string) => id,
+            get: () => ({createPersistentCallback}),
+          },
+        },
+      },
+    });
+
+    await runtime.createPersistentCallback({type: "meetingActionItems"});
+
+    expect(createPersistentCallback).toHaveBeenCalledWith(
+        17, {type: "meetingActionItems"});
+  });
 });

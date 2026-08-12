@@ -66,6 +66,12 @@ export type SlackFile = {
   permalink?: string;
 };
 
+/** Metadata plus a byte stream for one Slack-hosted file. */
+export type SlackFileDownload = {
+  file: SlackFile;
+  content: ReadableStream<Uint8Array>;
+};
+
 /** A single message posted in a conversation. */
 export type SlackMessage = {
   /** The message timestamp/ID (e.g. "1701361200.123456"). Unique within a conversation and used
@@ -96,10 +102,28 @@ export type SlackWorkspaceInfo = {
   domain: string;
 };
 
+/** Inbound Slack event kinds a workspace hook can request. */
+export type SlackInboundEventKind =
+  | "app_mention"
+  | "direct_message"
+  | "slash_command"
+  | "channel_message"
+  | "file_shared";
+
+/** Optional server-side filter applied before a Slack event starts a Gadget hook. */
+export type SlackEventSubscriptionOptions = {
+  /** Event kinds to receive. Defaults to mentions, direct messages, and slash commands. */
+  kinds?: SlackInboundEventKind[];
+  /** Restrict delivery to these exact Slack conversation IDs. */
+  channelIds?: string[];
+};
+
 /** An inbound event delivered to a workspace hook (see `SlackWorkspaceSession.subscribe`). */
 export type SlackInboundEvent = {
+  /** Slack's stable Events API ID. Use it to make processing idempotent across delivery retries. */
+  eventId?: string;
   /** What triggered the event. */
-  kind: "app_mention" | "direct_message" | "slash_command";
+  kind: SlackInboundEventKind;
   /** The workspace (team) the event came from. */
   teamId: string;
   /** The channel, DM, or group DM the event occurred in. */
@@ -108,6 +132,8 @@ export type SlackInboundEvent = {
   userId?: string;
   /** The message text, or the text following a slash command. Leading bot @mention is left intact. */
   text: string;
+  /** Files attached to the triggering message, or the file identified by a `file_shared` event. */
+  files?: SlackFile[];
   /** The triggering message's timestamp/ID. Absent for slash commands. */
   ts?: string;
   /** The thread to reply into: the thread root `ts` when the event is inside a thread, otherwise the
@@ -166,17 +192,29 @@ export interface SlackWorkspaceSession {
    *  bytes. */
   search(query: string): Promise<Cursor<SlackMessageEntry>>;
 
+  /** Download a Slack-hosted file attached in `conversationId`. Pass the channel and file IDs from
+   *  an inbound event or `SlackMessage.files`. Throws if the file is not shared in that conversation
+   *  or the connected app cannot read it. Consume the returned byte stream once. */
+  downloadFile(conversationId: string, fileId: string): Promise<SlackFileDownload>;
+
   /**
-   * Subscribe to inbound events for this workspace — app mentions, direct messages to the app, and
-   * slash commands. The user must approve the subscription before any events are delivered, and each
-   * delivered event is authorized as an observation. Requires the Slack app's Event Subscriptions
-   * (and any slash command) to point at this gatekeeper's `/events` request URL, and the app to be
-   * installed with a bot token.
+   * Subscribe to inbound events for this workspace. By default this receives app mentions, direct
+   * messages to the app, and slash commands. Pass `options` to opt into channel messages or file
+   * shares and to restrict delivery to exact channel IDs. The user must approve the subscription
+   * before any events are delivered, and each delivered event is authorized as an observation.
+   * Requires the matching Slack Event Subscriptions (and any slash command) to point at this
+   * gatekeeper's `/events` request URL, and the app to be installed with a bot token.
    *
-   * @param callback - A persistent stub (must be created with `ctx.restore()`) implementing
-   *   `SlackEventHook`; it is called once for each inbound event.
+   * @param callback - A persistent stub implementing `SlackEventHook`. Create it with
+   *   `ctx.restore()` from `executeCode`, or with
+   *   `env.GADGET_RUNTIME.createPersistentCallback()` from Gadget code.
+   * @param options - Optional event-kind and channel filters enforced by the Gatekeeper before the
+   *   hook starts. Omit it for the legacy mentions, DMs, and commands behavior.
    */
-  subscribe(callback: RpcStub<SlackEventHook>): Promise<void>;
+  subscribe(
+    callback: RpcStub<SlackEventHook>,
+    options?: SlackEventSubscriptionOptions,
+  ): Promise<void>;
 
   /** Post a reply back to Slack as the connected app, answering an inbound event (its channel and
    *  thread are reused). This is a write: it is queued for the user's approval before it is sent. */

@@ -266,13 +266,13 @@ export interface ScheduledTaskHook {
 /**
  * Workspace-scoped Scheduled Tasks capability.
  *
- * Define the callback in the Gadget's `[restore]()` method. Then call `ctx.restore()` directly from
- * `executeCode` and pass the resulting persistent stub to a registration method. Do not call
- * `this.ctx.restore()` inside a Gadget method invoked through an `env` Gadget binding; that facet
- * stub does not carry the required restore context. The parameters passed to `ctx.restore()` must
- * be serializable; the system passes them to `[restore]()` both immediately and when restoring the
- * callback later. The restored `RpcTarget` is a separate object and does not inherit the Gadget's
- * `ctx`; pass any required dependencies, such as `this.ctx.storage`, to it from `[restore]()`.
+ * Define the callback in the Gadget's `[restore]()` method. From `executeCode`, call `ctx.restore()`
+ * directly; from a Gadget method, call `this.env.GADGET_RUNTIME.createPersistentCallback()`.
+ * Never call `this.ctx.restore()` inside a Gadget facet because it lacks the supervisor restore
+ * context. Restore parameters must be serializable; the system passes them to `[restore]()` both
+ * immediately and when restoring the callback later. The restored `RpcTarget` is a separate object
+ * and does not inherit the Gadget's `ctx`; pass dependencies such as `this.ctx.storage` to it from
+ * `[restore]()`. Both supported creation paths bind the callback to the correct Gadget.
  *
  * Use the Scheduler binding shown in the agent environment directly; it does not need to be saved as
  * a Gadget binding. Registration returns a stable schedule ID immediately, but the schedule remains

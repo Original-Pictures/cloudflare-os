@@ -44,8 +44,8 @@ export interface EmailSession {
   /**
    * Request a callback on each inbound email.
    *
-   * @param callback - A persistent stub (must be created with ctx.restore()) implementing the
-   *   `EmailHook` interface, which will be called back whenever an email arrives.
+   * @param callback - A persistent stub implementing `EmailHook`. Create it with `ctx.restore()`
+   *   from `executeCode`, or with `env.GADGET_RUNTIME.createPersistentCallback()` from Gadget code.
    */
   subscribe(callback: RpcStub<EmailHook>): Promise<void>;
 }

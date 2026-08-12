@@ -91,6 +91,19 @@ type RawFile = {
   mimetype?: string;
   size?: number;
   permalink?: string;
+  url_private?: string;
+  url_private_download?: string;
+  channels?: string[];
+  groups?: string[];
+  ims?: string[];
+  shares?: Record<string, Record<string, unknown>>;
+};
+
+/** File metadata needed to authorize and stream a Slack-hosted download. */
+export type SlackFileInfo = {
+  file: SlackFile;
+  conversationIds: string[];
+  downloadUrl: string;
 };
 
 type RawMessage = {
@@ -263,6 +276,7 @@ const SLACK_ERROR_MESSAGES: Record<string, string> = {
   channel_not_found: "Slack conversation not found.",
   thread_not_found: "Slack thread not found.",
   message_not_found: "Slack message not found.",
+  file_not_found: "Slack file not found.",
   not_in_channel: "Not a member of this Slack conversation.",
   is_archived: "This Slack conversation is archived.",
   missing_scope: "This Slack connection lacks permission for that request.",
@@ -412,6 +426,53 @@ export class SlackApi {
       name: data.team?.name ?? "",
       domain: data.team?.domain ?? "",
     };
+  }
+
+  // ── Files ─────────────────────────────────────────────────────────
+
+  async getFileInfo(fileId: string): Promise<SlackFileInfo> {
+    let data = await this.#call<SlackApiEnvelope & {file?: RawFile}>("files.info", {file: fileId});
+    if (!data.file) throw new Error(`Slack file not found: ${fileId}`);
+    let raw = data.file;
+    let downloadUrl = raw.url_private_download ?? raw.url_private;
+    if (!downloadUrl) throw new Error("Slack did not provide a download URL for this file.");
+    let conversations = new Set([
+      ...(raw.channels ?? []), ...(raw.groups ?? []), ...(raw.ims ?? []),
+    ]);
+    for (let shared of Object.values(raw.shares ?? {})) {
+      for (let conversationId of Object.keys(shared)) conversations.add(conversationId);
+    }
+    return {file: toFile(raw), conversationIds: [...conversations], downloadUrl};
+  }
+
+  async downloadFileContent(info: SlackFileInfo): Promise<ReadableStream<Uint8Array>> {
+    let url = new URL(info.downloadUrl);
+    let token = await this.#getToken();
+    let response: Response | undefined;
+    // Follow redirects manually so the bearer token is never forwarded before validating the next
+    // host. Slack file downloads normally stay on slack.com/slack-edge.com.
+    for (let redirects = 0; redirects <= 3; redirects++) {
+      if (url.protocol !== "https:" ||
+          !(url.hostname === "slack.com" || url.hostname.endsWith(".slack.com") ||
+            url.hostname.endsWith(".slack-edge.com"))) {
+        throw new Error("Slack returned an unsupported file download URL.");
+      }
+      response = await fetch(url, {
+        headers: {Authorization: `Bearer ${token}`},
+        redirect: "manual",
+      });
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      let location = response.headers.get("Location");
+      response.body?.cancel();
+      if (!location || redirects === 3) throw new Error("Slack file download redirected too many times.");
+      url = new URL(location, url);
+    }
+    if (!response) throw new Error("Slack file download did not return a response.");
+    if (!response.ok || !response.body) {
+      response.body?.cancel();
+      throw new SlackApiError(undefined, response.status);
+    }
+    return response.body;
   }
 
   // ── Users ─────────────────────────────────────────────────────────

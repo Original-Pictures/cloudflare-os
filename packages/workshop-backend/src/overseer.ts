@@ -55,6 +55,9 @@ import agent from "agent.js";
 
 export default class extends WorkerEntrypoint {
   verify() {}
+  createPersistentCallback(params) {
+    return this.ctx.restore(params);
+  }
   async run(self, callbackResolvers) {
     let env = this.env;
     if (callbackResolvers) {
@@ -107,11 +110,20 @@ class PlaceholderRpcTarget extends RpcTarget {
 
 interface CodeModeEntrypoint extends WorkerEntrypoint {
   verify(): void;
+  createPersistentCallback(params: unknown): Promise<NativeRpcStub<RpcTarget>>;
   run(self?: unknown,
       callbackResolvers?: Record<string, {
         resolve: NativeRpcStub<(v: unknown) => void>,
         reject: NativeRpcStub<(e: unknown) => void>
       }>): Promise<void>;
+}
+
+const GADGET_RUNTIME_BINDING = "GADGET_RUNTIME";
+
+function assertGadgetBindingNameAvailable(name: string): void {
+  if (name === "GADGET" || name === GADGET_RUNTIME_BINDING) {
+    throw new Error(`The binding name \`${name}\` is reserved.`);
+  }
 }
 
 // =======================================================================================
@@ -1720,9 +1732,7 @@ class OverseerImpl implements AgentHooks {
   bindWorkpiece(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
                 chatId?: number): void {
     validateBindingName(name);
-    if (name === "GADGET") {
-      throw new Error("The binding name `GADGET` is reserved.");
-    }
+    assertGadgetBindingNameAvailable(name);
     let gadget = this.getGadgetRecord(gadgetId);
     let existing = gadget.bindings[name];
     if (existing) {
@@ -1772,9 +1782,7 @@ class OverseerImpl implements AgentHooks {
     }
     if (oldName === newName) return;
     validateBindingName(newName);
-    if (newName === "GADGET") {
-      throw new Error("The binding name `GADGET` is reserved.");
-    }
+    assertGadgetBindingNameAvailable(newName);
     if (gadget.bindings[newName]) {
       throw new Error(`There is already a binding named "${newName}".`);
     }
@@ -2042,11 +2050,11 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Build the flat `env` handed to a gadget's dynamically-loaded worker: the gadget's named
-  // bindings plus `GADGET` (the gadget's self-stub, kept for back-compat with existing gadget
-  // code). `forChatId` scopes visibility of provisional binding edges: an edge pending in that
-  // chat is included (the chat's own preview/test runs see its proposed additions), while edges
-  // pending in other chats -- or in any chat, when loading mainline -- are treated as
-  // nonexistent.
+  // bindings plus `GADGET` (the gadget's self-stub, kept for back-compat) and `GADGET_RUNTIME`
+  // (the platform lifecycle capability). `forChatId` scopes visibility of provisional binding
+  // edges: an edge pending in that chat is included (the chat's own preview/test runs see its
+  // proposed additions), while edges pending in other chats -- or in any chat, when loading
+  // mainline -- are treated as nonexistent.
   getEnvForLoader(gadgetId: WorkpieceId, caller: GatekeeperCaller, forChatId?: number): object {
     let env: Record<string, any> = {}
     let gadget = this.getGadgetRecord(gadgetId);
@@ -2054,6 +2062,10 @@ class OverseerImpl implements AgentHooks {
     for (let [name, edge] of this.visibleBindings(gadget, forChatId)) {
       env[name] = this.makeBindingLoopback({type: "gatekeeper", id: edge.target}, caller);
     }
+    env[GADGET_RUNTIME_BINDING] = this.ctx.exports.GadgetRuntimeLoopback({props: {
+      overseerId: this.ctx.id.toString(),
+      gadgetId,
+    }});
     return env;
   }
 
@@ -5378,6 +5390,44 @@ class OverseerImpl implements AgentHooks {
   #codeModeResolvers = new Map<string, (trace: TraceItem) => void>();
   #codeModeOutputSubscribers = new Map<string, (delta: string) => void>();
 
+  // Load a dynamic entrypoint through the Overseer's restore context. Any ctx.restore() call made
+  // by that entrypoint then seals a callback which restores through the selected Gadget facet.
+  // The codeId exists only while the entrypoint is being constructed: later restoration falls
+  // through to the Gadget's [restore]() implementation instead of reloading this worker.
+  async #loadWithGadgetRestoreContext(
+      gadgetId: WorkpieceId, workerDef: WorkerLoaderWorkerCode)
+      : Promise<Fetcher<CodeModeEntrypoint>> {
+    this.getGadgetRecord(gadgetId);
+    let codeId = crypto.randomUUID();
+    try {
+      this.#codeIdMap.set(codeId, workerDef);
+      return await this.ctx.restore({type: "gadget", gadgetId, codeId});
+    } finally {
+      this.#codeIdMap.delete(codeId);
+    }
+  }
+
+  // Creates a persistent callback owned by one exact Gadget. This is called only through the
+  // GadgetRuntimeLoopback capability whose sealed props supply gadgetId; untrusted Gadget code
+  // cannot select another Gadget as the restoration target.
+  async createPersistentCallback(
+      gadgetId: WorkpieceId, params: unknown): Promise<NativeRpcStub<RpcTarget>> {
+    let workerDef: WorkerLoaderWorkerCode = {
+      compatibilityDate: "2026-02-01",
+      compatibilityFlags: ["allow_irrevocable_stub_storage"],
+      mainModule: "harness.js",
+      modules: {
+        "harness.js": CODE_MODE_HARNESS,
+        "agent.js": "export default async function() {}",
+      },
+      env: {},
+      globalOutbound: null,
+    };
+    let entrypoint = await this.#loadWithGadgetRestoreContext(gadgetId, workerDef);
+    await entrypoint.verify();
+    return entrypoint.createPersistentCallback(params);
+  }
+
   async executeCodeMode(chatId: number, code: string,
                         initiator: AiChatAuthorInfo, initiatorModelId: string,
                         bindings: Record<string, ChatBindingEntry>,
@@ -5434,17 +5484,7 @@ class OverseerImpl implements AgentHooks {
         // However, as soon as we remove `codeId` from the table, these params will redirect to
         // point at the gadget instead. Hence, ctx.restore() inside the code mode worker will
         // actually create RpcStubs that point at the gadget's `[restore]()` method. Whoa!
-        let codeId = crypto.randomUUID();
-        try {
-          this.#codeIdMap.set(codeId, workerDef);
-          entrypoint = await this.ctx.restore({
-            type: "gadget",
-            gadgetId: restoreGadgetId,
-            codeId,
-          });
-        } finally {
-          this.#codeIdMap.delete(codeId);
-        }
+        entrypoint = await this.#loadWithGadgetRestoreContext(restoreGadgetId, workerDef);
       }
 
       // First check the code actually starts up. Treat startup errors as total failures.
@@ -6287,14 +6327,13 @@ type OverseerRestoreParams = {
   // gadget (or the default gadget was deleted), restoration fails with an explicit error.
   gadgetId?: WorkpieceId;
 
-  // A hack: If present, and if the executeCode injection table currently contains this ID, then
-  // instead of returning the gadget stub, [restore]() loads a dynamic worker.
+  // A hack: If present, and if the restore-context injection table currently contains this ID,
+  // then instead of returning the gadget stub, [restore]() loads a dynamic worker.
   //
-  // This is a super-tricky hack: When an executeCode tool call runs, we load the dynamic worker
-  // by putting the code we want into the code table under `codeId`, then calling ctx.restore()
-  // with `codeId`, then clearing the ID from the code table. This gets us a stub pointing at the
-  // code mode dynamic worker, but if that worker itself invokes ctx.restore(), it will actually
-  // have the effect of creating an RPC stub that restores from the gadget's [restore]() method.
+  // This is a super-tricky hack shared by executeCode and GADGET_RUNTIME: load a dynamic worker by
+  // putting its code into the table under `codeId`, call ctx.restore() with that ID, then clear it.
+  // The result points at the dynamic worker initially, but ctx.restore() inside that worker creates
+  // an RPC stub which later falls through to the Gadget's [restore]() method after the ID is gone.
   codeId?: string;
 };
 
@@ -6804,6 +6843,12 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   [restore](params: OverseerRestoreParams): any {
     return this.impl.restore(params);
   }
+
+  /** Creates a persistent callback which restores through the specified Gadget. */
+  createPersistentCallback(
+      gadgetId: WorkpieceId, params: unknown): Promise<NativeRpcStub<RpcTarget>> {
+    return this.impl.createPersistentCallback(gadgetId, params);
+  }
 }
 
 type GatekeeperCaller = {
@@ -6836,6 +6881,23 @@ type BindingLoopbackTarget = {
   type: "gadget" | "gatekeeper";
   id: WorkpieceId;
 };
+
+type GadgetRuntimeLoopbackProps = {
+  overseerId: string;
+  gadgetId: WorkpieceId;
+};
+
+/** Platform lifecycle capability injected into every Gadget as `env.GADGET_RUNTIME`. */
+export class GadgetRuntimeLoopback
+    extends WorkerEntrypoint<Cloudflare.Env, GadgetRuntimeLoopbackProps> {
+  /** Creates a persistent callback restored by the exact Gadget named in this capability's props. */
+  createPersistentCallback(params: unknown): Promise<NativeRpcStub<RpcTarget>> {
+    let ns = this.ctx.exports.OverseerDurableObject;
+    let overseer: DurableObjectStub<OverseerDurableObject> =
+        ns.get(ns.idFromString(this.ctx.props.overseerId));
+    return overseer.createPersistentCallback(this.ctx.props.gadgetId, params);
+  }
+}
 
 // Horrible hack: At present the `env` of a dynamic isolate can contain ServiceStubs but cannot
 // contain RpcStubs. But if we ask the gatekeeper to open a session, we get an RpcStub. So we
