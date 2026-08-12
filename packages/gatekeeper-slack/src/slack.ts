@@ -1525,6 +1525,21 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
       threadTs: event.threadTs,
     });
   }
+
+  async postMessage(channelId: string, text: string): Promise<void> {
+    if (!this.#ctx.tracker) {
+      throw new Error("Posting to Slack is only available on a workspace binding.");
+    }
+    if (!channelId.trim()) throw new Error("A channel ID is required to post a message.");
+    if (!text.trim()) throw new Error("Message text must not be empty.");
+    // A new top-level channel post (no thread), for proactive/scheduled sends with no inbound event
+    // to reply to. Routed through the same approval queue and bot token as postReply.
+    await this.#ctx.tracker.submitPostReply(this.#ctx.approvalQueue, {
+      channelId,
+      text,
+      threadTs: undefined,
+    });
+  }
 }
 
 @validateRpc()

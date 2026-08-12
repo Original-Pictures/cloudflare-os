@@ -5,9 +5,10 @@
     "label": "OAuth client ID",
     "consoleUrl": "https://api.slack.com/apps",
     "setupSteps": [
-      "Create a Slack app (from scratch) in the workspace you want gadgets to read.",
+      "Create a Slack app (from scratch) in the workspace you want gadgets to use.",
       "Under OAuth & Permissions, add the redirect URL below.",
-      "Enable token rotation (OAuth & Permissions > Token Rotation) — tokens are then short-lived and refreshed automatically.",
+      "Do NOT enable token rotation (OAuth & Permissions > Token Rotation). It cannot be turned off once enabled and breaks two-way messaging (bot tokens are not refreshed).",
+      "For two-way (mentions, DMs, slash commands, replies): add the bot scopes chat:write, app_mentions:read, commands, im:history, im:read; enable Event Subscriptions with Request URL {PUBLIC_BASE_URL}/gatekeeper/slack/events subscribed to app_mention and message.im; and install the app so a bot token is issued.",
       "Copy the app's Client ID and Client Secret (Basic Information > App Credentials) here."
     ],
     "redirectUriTemplate": "{PUBLIC_BASE_URL}/gatekeeper/slack/oauth"
@@ -16,5 +17,16 @@
     "name": "CLIENT_SECRET",
     "kind": "secret",
     "label": "OAuth client secret"
+  },
+  {
+    "name": "SLACK_SIGNING_SECRET",
+    "kind": "secret",
+    "label": "Signing secret (required for two-way / inbound events)",
+    "consoleUrl": "https://api.slack.com/apps",
+    "setupSteps": [
+      "Copy the app's Signing Secret (Basic Information > App Credentials) here.",
+      "Required for inbound events and slash commands: /events and /commands verify Slack's request signature and fail closed (401) until this is set, so Slack cannot even verify the Event Subscriptions Request URL without it.",
+      "Read-only (user-token) installs that never receive events can leave this unset."
+    ]
   }
 ]

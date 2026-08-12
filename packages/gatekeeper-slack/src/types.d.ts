@@ -181,6 +181,12 @@ export interface SlackWorkspaceSession {
   /** Post a reply back to Slack as the connected app, answering an inbound event (its channel and
    *  thread are reused). This is a write: it is queued for the user's approval before it is sent. */
   postReply(event: SlackInboundEvent, text: string): Promise<void>;
+
+  /** Post a new top-level message to a channel as the connected app, without an inbound event to
+   *  answer — for proactive or scheduled sends (e.g. a status digest). `channelId` is a Slack
+   *  channel ID (e.g. "C0BPE0YMWMT"). This is a write: it is queued for the user's approval before
+   *  it is sent. Requires the app to be installed with a bot token and a member of the channel. */
+  postMessage(channelId: string, text: string): Promise<void>;
 }
 
 /**
