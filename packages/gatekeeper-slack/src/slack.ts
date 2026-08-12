@@ -1042,6 +1042,14 @@ type PendingReply = {
 
 const NO_ACTIONS: ActionKind[] = [];
 
+// Posting a reply or a new top-level message both go through submitPostReply; group them under one
+// kind so the user can opt into hands-off Slack posting with a single auto-approval rule.
+const POST_MESSAGE_ACTION: ActionKind = {
+  tag: "slack.postMessage",
+  label: "Post Slack messages & replies",
+};
+const POST_ACTIONS: ActionKind[] = [POST_MESSAGE_ACTION];
+
 function unreachableAction(): never {
   throw new Error("Slack gatekeeper is read-only and submits no actions.");
 }
@@ -1085,7 +1093,7 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
-    return NO_ACTIONS;
+    return POST_ACTIONS;
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<SlackWorkspaceSession> {
@@ -1244,6 +1252,10 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
       // before the agent continues, and do not advertise revert.
       implementsRevert: false,
       awaitDecision: true,
+      // Eligible for auto-approval only once the user enables a rule for POST_MESSAGE_ACTION on this
+      // gatekeeper; until then this stays a manual gate (awaitDecision above still applies).
+      actionKind: POST_MESSAGE_ACTION,
+      autoApprovable: true,
     };
     await approvalQueue.submitAction(id, description);
   }

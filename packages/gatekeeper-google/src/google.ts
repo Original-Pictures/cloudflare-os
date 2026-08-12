@@ -1395,6 +1395,24 @@ function describeOutboundMessage(intro: string, message: GmailOutboundMessage): 
   return `${intro}\n\n${fields.join("\n\n")}`;
 }
 
+// Auto-approval kinds per GmailAction["type"]. send/reply/forward all dispatch outbound mail, so
+// they share one "send" kind: enabling it is the single, deliberate opt-in for auto-sending email —
+// kept separate from the benign mailbox-management kinds. Gated per-action by a user-enabled rule.
+const GMAIL_SEND_ACTION: ActionKind = { tag: "gmail.send", label: "Send emails (send/reply/forward)" };
+const GMAIL_ACTION_KINDS: Record<GmailAction["type"], ActionKind> = {
+  archive:    { tag: "gmail.archive",    label: "Archive threads" },
+  trash:      { tag: "gmail.trash",      label: "Trash threads" },
+  markRead:   { tag: "gmail.markRead",   label: "Mark threads read" },
+  markUnread: { tag: "gmail.markUnread", label: "Mark threads unread" },
+  send:       GMAIL_SEND_ACTION,
+  reply:      GMAIL_SEND_ACTION,
+  forward:    GMAIL_SEND_ACTION,
+};
+const GMAIL_AUTO_APPROVABLE_ACTIONS: ActionKind[] = [
+  GMAIL_ACTION_KINDS.archive, GMAIL_ACTION_KINDS.trash,
+  GMAIL_ACTION_KINDS.markRead, GMAIL_ACTION_KINDS.markUnread, GMAIL_SEND_ACTION,
+];
+
 async function submitGmailAction(
     ctx: GmailSessionContext,
     action: GmailAction,
@@ -1404,7 +1422,12 @@ async function submitGmailAction(
   }
   let actionId = ctx.pendingActions.submit(action);
   try {
-    await ctx.approvalQueue.submitAction(actionId, { ...desc, implementsRevert: false });
+    await ctx.approvalQueue.submitAction(actionId, {
+      ...desc,
+      implementsRevert: false,
+      actionKind: GMAIL_ACTION_KINDS[action.type],
+      autoApprovable: true,
+    });
   } catch (err) {
     ctx.pendingActions.remove(actionId);
     throw err;
@@ -1849,7 +1872,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
   }
 
   async getAutoApprovableActions() {
-    return [];
+    return GMAIL_AUTO_APPROVABLE_ACTIONS;
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
@@ -2680,6 +2703,14 @@ type GoogleCalendarUpdateAction = GoogleCalendarActionBase & {
 
 type GoogleCalendarAction = GoogleCalendarCreateAction | GoogleCalendarUpdateAction;
 
+// Auto-approval kinds per calendar write. Both are revertible; note either can notify attendees
+// when sendUpdates != "none". Gated per-action by a user-enabled rule for the matching kind.
+const CALENDAR_ACTION_KINDS: Record<GoogleCalendarAction["type"], ActionKind> = {
+  createEvent: { tag: "calendar.createEvent", label: "Create calendar events" },
+  updateEvent: { tag: "calendar.updateEvent", label: "Update calendar events" },
+};
+const CALENDAR_AUTO_APPROVABLE_ACTIONS: ActionKind[] = Object.values(CALENDAR_ACTION_KINDS);
+
 type GoogleCalendarRevertInfo =
   | {
       type: "createdEvent";
@@ -2867,7 +2898,7 @@ export class GoogleCalendarGatekeeperImpl
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
-    return [];
+    return CALENDAR_AUTO_APPROVABLE_ACTIONS;
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
@@ -3184,6 +3215,8 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
             (event.attendees?.length ? ` Attendees: ${event.attendees.map(a => a.email).join(", ")}.` : "") +
             ` Send updates: ${action.sendUpdates}.`,
         implementsRevert: true,
+        actionKind: CALENDAR_ACTION_KINDS.createEvent,
+        autoApprovable: true,
       });
     } catch (error) {
       this.#pendingActions.remove(actionId);
@@ -3228,6 +3261,8 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
             `${summarizeCalendarPatch(patch)}. ` +
             `Send updates: ${action.sendUpdates}.`,
         implementsRevert: true,
+        actionKind: CALENDAR_ACTION_KINDS.updateEvent,
+        autoApprovable: true,
       });
     } catch (error) {
       this.#pendingActions.remove(actionId);

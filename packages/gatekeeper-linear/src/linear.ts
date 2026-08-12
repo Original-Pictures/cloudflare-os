@@ -15,6 +15,7 @@ import {
   AccountDescription,
   SupportedResource,
   ResourceConfiguratorFrame,
+  ActionKind,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   Cursor,
@@ -935,6 +936,20 @@ type StoredActionDraft = StoredAction extends infer T
 
 type ActionDescriptionDraft = { title: string; body: string; implementsRevert: boolean };
 
+// Auto-approval kinds, one per StoredAction["kind"], so the user can opt into hands-off Linear
+// writes at the granularity of the operation (e.g. auto-approve issue creates but still gate
+// archives). The per-action `autoApprovable` verdict below is still gated by a user-enabled rule.
+const LINEAR_ACTION_KINDS: Record<StoredAction["kind"], ActionKind> = {
+  createIssue:  { tag: "linear.createIssue",  label: "Create issues" },
+  updateIssue:  { tag: "linear.updateIssue",  label: "Update issues" },
+  addLabels:    { tag: "linear.addLabels",    label: "Add labels to issues" },
+  removeLabels: { tag: "linear.removeLabels", label: "Remove labels from issues" },
+  postComment:  { tag: "linear.postComment",  label: "Comment on issues" },
+  createLabel:  { tag: "linear.createLabel",  label: "Create labels" },
+  archive:      { tag: "linear.archive",      label: "Archive issues" },
+};
+const LINEAR_AUTO_APPROVABLE_ACTIONS: ActionKind[] = Object.values(LINEAR_ACTION_KINDS);
+
 type LinearGatekeeperImplProps = {
   userObjectId: string;
   workspaceUrlKey: string;
@@ -1112,6 +1127,8 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
       title: description.title,
       description: description.body,
       implementsRevert: description.implementsRevert,
+      actionKind: LINEAR_ACTION_KINDS[action.kind],
+      autoApprovable: true,
     });
   }
 
@@ -1432,7 +1449,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
   }
 
   async getAutoApprovableActions() {
-    return [];
+    return LINEAR_AUTO_APPROVABLE_ACTIONS;
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<LinearWorkspace | LinearTeam | LinearIssue> {

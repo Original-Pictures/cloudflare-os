@@ -4,6 +4,7 @@ import {
   ApprovalQueue,
   stripTrailingSlashes,
   type ActionDescription,
+  type ActionKind,
   type AccountDescription,
   type Cursor,
   type Gatekeeper,
@@ -254,6 +255,24 @@ type GitHubAction =
   | PostReviewAction
   | ReplyToDiffCommentAction
   | MergePullRequestAction;
+
+// Auto-approval kinds, one per GitHubAction["type"], so the user can opt into hands-off GitHub
+// writes at the granularity of the operation. The per-action `autoApprovable` verdict set in
+// submitActionForApproval() is still gated by a user-enabled rule for the matching kind.
+const GITHUB_ACTION_KINDS: Record<GitHubAction["type"], ActionKind> = {
+  createIssue:         { tag: "github.createIssue",         label: "Create issues" },
+  createPullRequest:   { tag: "github.createPullRequest",   label: "Create pull requests" },
+  setTitle:            { tag: "github.setTitle",            label: "Rename issues/PRs" },
+  setBody:             { tag: "github.setBody",             label: "Edit issue/PR bodies" },
+  addLabels:           { tag: "github.addLabels",           label: "Add labels" },
+  removeLabels:        { tag: "github.removeLabels",        label: "Remove labels" },
+  changeState:         { tag: "github.changeState",         label: "Open/close issues & PRs" },
+  postComment:         { tag: "github.postComment",         label: "Post comments" },
+  postReview:          { tag: "github.postReview",          label: "Submit PR reviews" },
+  replyToDiffComment:  { tag: "github.replyToDiffComment",  label: "Reply to diff threads" },
+  mergePullRequest:    { tag: "github.mergePullRequest",    label: "Merge pull requests" },
+};
+const GITHUB_AUTO_APPROVABLE_ACTIONS: ActionKind[] = Object.values(GITHUB_ACTION_KINDS);
 
 type StoredActionRecord = {
   action: GitHubAction;
@@ -3214,7 +3233,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async getAutoApprovableActions() {
-    return [];
+    return GITHUB_AUTO_APPROVABLE_ACTIONS;
   }
 
   async submitActionForApproval(
@@ -3223,6 +3242,14 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     description: ActionDescription,
   ): Promise<void> {
     this.#stageAction(action);
+    // Tag the action by operation and mark it eligible for auto-approval. This only takes effect
+    // once the user enables a rule for the matching kind on this gatekeeper; otherwise it stays a
+    // normal manual gate. A caller may pre-set these on `description` to override.
+    description = {
+      actionKind: GITHUB_ACTION_KINDS[action.type],
+      autoApprovable: true,
+      ...description,
+    };
     try {
       await approvalQueue.submitAction(action.approvalId, description);
     } catch (error) {
