@@ -30,11 +30,21 @@ import {
   type GitHubPullFileResponse,
   type GitHubPullRequestResponse,
   type GitHubPullRequestReviewCommentResponse,
+  type GitHubWorkflowJobResponse,
+  type GitHubWorkflowRunResponse,
 } from "./github-api";
 import { assertIssueSearchResultsInRepo, buildIssueSearchQuery } from "./github-search";
+import {
+  MAX_TEXT_FILE_BYTES,
+  boundJobLog,
+  hasControlCharacters,
+  validateCommitFilesOptions,
+  validateRepoPath,
+} from "./github-ci";
 import GITHUB_LOGO_SVG from "./github-logo.svg";
 import type {
   GitHubActor,
+  GitHubCommitFilesOptions,
   GitHubCreateIssueOptions,
   GitHubCreatePullRequestOptions,
   GitHubDiffCommentTarget,
@@ -65,6 +75,13 @@ import type {
   GitHubRepoMetadata,
   GitHubRepoRef,
   GitHubReviewDecision,
+  GitHubTextFile,
+  GitHubWorkflowConclusion,
+  GitHubWorkflowJobFilter,
+  GitHubWorkflowJobLog,
+  GitHubWorkflowJobSummary,
+  GitHubWorkflowRunFilter,
+  GitHubWorkflowRunSummary,
 } from "./types";
 import TYPES_CODE from "./types.txt";
 import {
@@ -243,6 +260,11 @@ type MergePullRequestAction = BaseAction & {
   options?: GitHubPullRequestMergeOptions;
 };
 
+type CommitFilesAction = BaseAction & {
+  type: "commitFiles";
+  options: GitHubCommitFilesOptions;
+};
+
 type GitHubAction =
   | CreateIssueAction
   | CreatePullRequestAction
@@ -254,7 +276,8 @@ type GitHubAction =
   | PostCommentAction
   | PostReviewAction
   | ReplyToDiffCommentAction
-  | MergePullRequestAction;
+  | MergePullRequestAction
+  | CommitFilesAction;
 
 // Auto-approval kinds, one per GitHubAction["type"], so the user can opt into hands-off GitHub
 // writes at the granularity of the operation. The per-action `autoApprovable` verdict set in
@@ -271,6 +294,7 @@ const GITHUB_ACTION_KINDS: Record<GitHubAction["type"], ActionKind> = {
   postReview:          { tag: "github.postReview",          label: "Submit PR reviews" },
   replyToDiffComment:  { tag: "github.replyToDiffComment",  label: "Reply to diff threads" },
   mergePullRequest:    { tag: "github.mergePullRequest",    label: "Merge pull requests" },
+  commitFiles:         { tag: "github.commitFiles",         label: "Create fix branches & commits" },
 };
 const GITHUB_AUTO_APPROVABLE_ACTIONS: ActionKind[] = Object.values(GITHUB_ACTION_KINDS);
 
@@ -291,6 +315,7 @@ const VIEWER_CACHE_TTL_MS = 5 * 60 * 1000;
 const DISCUSSION_SYNC_OVERLAP_MS = 5 * 1000;
 const DISCUSSION_SYNC_BAIL_LIMIT = 500;
 const MAX_REPLY_TARGET_HOPS = 50;
+const MAX_WORKFLOW_PAGE_SIZE = 100;
 
 const GITHUB_LOGO_URL = `data:image/svg+xml,${encodeURIComponent(GITHUB_LOGO_SVG)}`;
 
@@ -477,6 +502,77 @@ function textSnippet(markdown?: string, fallback = ""): string {
 
 function parseDate(value?: string | null): Date | undefined {
   return value ? new Date(value) : undefined;
+}
+
+function workflowConclusion(value?: string | null): GitHubWorkflowConclusion | undefined {
+  switch (value) {
+    case "action_required":
+    case "cancelled":
+    case "failure":
+    case "neutral":
+    case "skipped":
+    case "stale":
+    case "startup_failure":
+    case "success":
+    case "timed_out":
+      return value;
+    default:
+      return undefined;
+  }
+}
+
+function normalizeWorkflowRun(response: GitHubWorkflowRunResponse): GitHubWorkflowRunSummary {
+  return {
+    id: response.id,
+    attempt: response.run_attempt ?? 1,
+    name: response.name ?? "GitHub Actions workflow",
+    event: response.event,
+    status: response.status,
+    conclusion: workflowConclusion(response.conclusion),
+    headBranch: response.head_branch ?? undefined,
+    headSha: response.head_sha,
+    workflowId: response.workflow_id,
+    runNumber: response.run_number,
+    createdAt: new Date(response.created_at),
+    updatedAt: new Date(response.updated_at),
+    url: response.html_url,
+  };
+}
+
+function normalizeWorkflowJob(response: GitHubWorkflowJobResponse): GitHubWorkflowJobSummary {
+  return {
+    id: response.id,
+    runId: response.run_id,
+    name: response.name,
+    status: response.status,
+    conclusion: workflowConclusion(response.conclusion),
+    startedAt: parseDate(response.started_at),
+    completedAt: parseDate(response.completed_at),
+    runnerName: response.runner_name ?? undefined,
+    labels: response.labels ?? [],
+    url: response.html_url,
+  };
+}
+
+function positiveInteger(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive integer.`);
+  }
+}
+
+function decodeBase64Utf8(content: string): string {
+  const compact = content.replace(/\s+/g, "");
+  let bytes: Uint8Array;
+  try {
+    bytes = Uint8Array.from(atob(compact), char => char.charCodeAt(0));
+  } catch {
+    throw new Error("GitHub returned invalid base64 file content.");
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
+  } catch {
+    throw new Error("The requested repository file is not valid UTF-8 text.");
+  }
 }
 
 function normalizeStateReason(reason?: string | null): "completed" | "notPlanned" | undefined {
@@ -1951,6 +2047,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
   #markActionApproved(action: GitHubAction, revertInfo?: GitHubRevertInfo): void {
     const record = this.#requireActionRecord(action.approvalId);
+    record.action = action;
     record.state = "approved";
     record.appliedAt = Date.now();
     if (revertInfo) {
@@ -1984,6 +2081,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       case "replyToDiffComment":
       case "mergePullRequest":
         return kind === "pull" && action.pullId === provisionalId;
+      case "commitFiles":
+        return false;
     }
   }
 
@@ -2050,6 +2149,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         if (kind !== "pull") return false;
         return this.#entityIdMatches(action.pullId, logicalId);
       }
+
+      if (action.type === "commitFiles") return false;
 
       return action.targetKind === kind && this.#entityIdMatches(action.targetId, logicalId);
     });
@@ -3460,6 +3561,64 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         this.#clearCaches();
         return;
       }
+      case "commitFiles": {
+        const { options } = action;
+        const baseReference = await this.#withApi(api => api.getReference(
+          action.owner,
+          action.repo,
+          `heads/${options.baseRef}`,
+        ));
+        if (baseReference.object.sha.toLowerCase() !== options.expectedBaseSha.toLowerCase()) {
+          throw new Error(
+            `Base branch ${options.baseRef} moved from ${options.expectedBaseSha} to ` +
+            `${baseReference.object.sha}; refusing to create a stale fix branch.`,
+          );
+        }
+
+        const baseCommit = await this.#withApi(api => api.getGitCommit(
+          action.owner,
+          action.repo,
+          options.expectedBaseSha,
+        ));
+        const treeEntries: Array<{
+          path: string;
+          mode: "100644";
+          type: "blob";
+          sha: string | null;
+        }> = [];
+        for (const file of options.files) {
+          const sha = file.content === undefined
+            ? null
+            : (await this.#withApi(api => api.createBlob(
+                action.owner,
+                action.repo,
+                file.content!,
+              ))).sha;
+          treeEntries.push({ path: file.path, mode: "100644", type: "blob", sha });
+        }
+        const tree = await this.#withApi(api => api.createTree(
+          action.owner,
+          action.repo,
+          baseCommit.tree.sha,
+          treeEntries,
+        ));
+        const commit = await this.#withApi(api => api.createCommit(
+          action.owner,
+          action.repo,
+          options.message,
+          tree.sha,
+          [options.expectedBaseSha],
+        ));
+        await this.#withApi(api => api.createReference(
+          action.owner,
+          action.repo,
+          `refs/heads/${options.branch}`,
+          commit.sha,
+        ));
+        this.#markActionApproved(action);
+        this.#clearCaches();
+        return;
+      }
     }
   }
 
@@ -3583,6 +3742,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       case "createPullRequest":
       case "postReview":
       case "mergePullRequest":
+      case "commitFiles":
         return {
           message: "This GitHub action cannot be automatically reverted.",
           canRetry: false,
@@ -3628,6 +3788,110 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
   async searchPullRequests(query: GitHubPullRequestSearch, pageSize: number): Promise<Cursor<GitHubPullRequestSummary>> {
     return this.#searchPullSummaries(query, pageSize);
+  }
+
+  async workflowRuns(filter: GitHubWorkflowRunFilter | undefined): Promise<Cursor<GitHubWorkflowRunSummary>> {
+    const pageSize = Math.min(Math.max(filter?.resultsPerPage ?? 30, 1), MAX_WORKFLOW_PAGE_SIZE);
+    return new StreamingCursor<GitHubWorkflowRunSummary>({
+      fetchPage: async (page, perPage) => {
+        const result = await this.#withApi(api => api.listWorkflowRuns(
+          this.ctx.props.owner,
+          this.ctx.props.repo,
+          {
+            actor: filter?.actor,
+            branch: filter?.branch,
+            event: filter?.event,
+            // GitHub overloads the REST `status` query with both active statuses and terminal
+            // conclusions; expose them separately in Titan's typed contract for clarity.
+            status: filter?.conclusion ?? filter?.status,
+            per_page: perPage,
+            page,
+          },
+          filter?.workflowId,
+        ));
+        return result.workflow_runs.map(normalizeWorkflowRun);
+      },
+      overlay: item => item,
+      filter: () => true,
+      comparator: () => 0,
+      injectedItems: [],
+      pageSize,
+    });
+  }
+
+  async workflowJobs(
+    runId: number,
+    filter: GitHubWorkflowJobFilter | undefined,
+  ): Promise<Cursor<GitHubWorkflowJobSummary>> {
+    positiveInteger(runId, "runId");
+    const pageSize = Math.min(Math.max(filter?.resultsPerPage ?? 30, 1), MAX_WORKFLOW_PAGE_SIZE);
+    return new StreamingCursor<GitHubWorkflowJobSummary>({
+      fetchPage: async (page, perPage) => {
+        const result = await this.#withApi(api => api.listWorkflowJobs(
+          this.ctx.props.owner,
+          this.ctx.props.repo,
+          runId,
+          { filter: filter?.filter, per_page: perPage, page },
+        ));
+        return result.jobs.map(normalizeWorkflowJob);
+      },
+      overlay: item => item,
+      filter: () => true,
+      comparator: () => 0,
+      injectedItems: [],
+      pageSize,
+    });
+  }
+
+  async workflowJobLog(jobId: number): Promise<GitHubWorkflowJobLog> {
+    positiveInteger(jobId, "jobId");
+    const text = await this.#withApi(api => api.downloadWorkflowJobLog(
+      this.ctx.props.owner,
+      this.ctx.props.repo,
+      jobId,
+    ));
+    return { jobId, ...boundJobLog(text) };
+  }
+
+  async textFile(path: string, ref: string): Promise<GitHubTextFile> {
+    const normalizedPath = validateRepoPath(path);
+    if (!ref.trim() || ref.length > 255) {
+      throw new Error("Repository file ref must contain 1 to 255 characters.");
+    }
+    const response = await this.#withApi(api => api.getContent(
+      this.ctx.props.owner,
+      this.ctx.props.repo,
+      normalizedPath,
+      ref,
+    ));
+    if (Array.isArray(response) || response.type !== "file") {
+      throw new Error(`${normalizedPath} is not a repository file.`);
+    }
+    if (response.size > MAX_TEXT_FILE_BYTES) {
+      throw new Error(`Repository file ${normalizedPath} exceeds ${MAX_TEXT_FILE_BYTES} bytes.`);
+    }
+    if (response.encoding !== "base64" || response.content === undefined) {
+      throw new Error(`Repository file ${normalizedPath} is not available as inline text content.`);
+    }
+    return {
+      path: response.path,
+      sha: response.sha,
+      size: response.size,
+      ref,
+      text: decodeBase64Utf8(response.content),
+      url: response.html_url ?? `${canonicalRepoUrl(this.ctx.props.owner, this.ctx.props.repo)}/blob/${encodeURIComponent(ref)}/${normalizedPath}`,
+    };
+  }
+
+  async prepareCommitFiles(options: GitHubCommitFilesOptions): Promise<CommitFilesAction> {
+    return {
+      type: "commitFiles",
+      approvalId: this.#nextActionId(),
+      submittedAt: Date.now(),
+      owner: this.ctx.props.owner,
+      repo: this.ctx.props.repo,
+      options: validateCommitFilesOptions(options),
+    };
   }
 
   async prepareCreateIssue(options: GitHubCreateIssueOptions): Promise<CreateIssueAction> {
@@ -3909,6 +4173,62 @@ class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSession {
       description: `Search pull requests in the GitHub repository for "${query.text}".`,
     });
     return this.#gatekeeper.searchPullRequests(query, query.resultsPerPage ?? 50);
+  }
+
+  async listWorkflowRuns(options?: GitHubWorkflowRunFilter): Promise<Cursor<GitHubWorkflowRunSummary>> {
+    await this.#approvalQueue.authorizeObservation({
+      title: "List GitHub Actions workflow runs",
+      description: "List recent GitHub Actions workflow runs in the connected repository.",
+    });
+    return this.#gatekeeper.workflowRuns(options);
+  }
+
+  async listWorkflowJobs(
+    runId: number,
+    options?: GitHubWorkflowJobFilter,
+  ): Promise<Cursor<GitHubWorkflowJobSummary>> {
+    positiveInteger(runId, "runId");
+    await this.#approvalQueue.authorizeObservation({
+      title: `List jobs for workflow run ${runId}`,
+      description: `List GitHub Actions jobs belonging to workflow run ${runId}.`,
+    });
+    return this.#gatekeeper.workflowJobs(runId, options);
+  }
+
+  async readWorkflowJobLog(jobId: number): Promise<GitHubWorkflowJobLog> {
+    positiveInteger(jobId, "jobId");
+    await this.#approvalQueue.authorizeObservation({
+      title: `Read workflow job ${jobId} log`,
+      description: `Read the bounded plain-text GitHub Actions log for job ${jobId}.`,
+    });
+    return this.#gatekeeper.workflowJobLog(jobId);
+  }
+
+  async readFile(path: string, ref: string): Promise<GitHubTextFile> {
+    const normalizedPath = validateRepoPath(path);
+    if (!ref.trim() || ref.length > 255 || hasControlCharacters(ref)) {
+      throw new Error("Repository file ref must contain 1 to 255 printable characters.");
+    }
+    await this.#approvalQueue.authorizeObservation({
+      title: `Read repository file ${normalizedPath}`,
+      description: `Read ${normalizedPath} from the connected repository at ref ${ref}.`,
+    });
+    return this.#gatekeeper.textFile(normalizedPath, ref);
+  }
+
+  async commitFiles(options: GitHubCommitFilesOptions): Promise<void> {
+    const action = await this.#gatekeeper.prepareCommitFiles(options);
+    const changedPaths = action.options.files.map(file => file.path).join(", ");
+    await this.#gatekeeper.submitActionForApproval(this.#approvalQueue, action, {
+      title: `Create fix branch ${action.options.branch}`,
+      description:
+        `Create branch ${action.options.branch} from ${action.options.baseRef} at ` +
+        `${action.options.expectedBaseSha}, then commit changes to: ${changedPaths}.`,
+      implementsRevert: false,
+      // The branch does not exist until every Git object is ready. Wait so a subsequent PR action
+      // cannot race ahead of this approval or refer to a branch that has not been published.
+      awaitDecision: true,
+    });
   }
 }
 

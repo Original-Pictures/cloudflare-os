@@ -139,6 +139,61 @@ export type GitHubCompareResponse = {
   files?: GitHubPullFileResponse[];
 };
 
+export type GitHubWorkflowRunResponse = {
+  id: number;
+  run_attempt?: number;
+  name?: string | null;
+  event: string;
+  status: "queued" | "in_progress" | "completed";
+  conclusion?: string | null;
+  head_branch?: string | null;
+  head_sha: string;
+  workflow_id: number;
+  run_number: number;
+  created_at: string;
+  updated_at: string;
+  html_url: string;
+};
+
+export type GitHubWorkflowJobResponse = {
+  id: number;
+  run_id: number;
+  name: string;
+  status: "queued" | "in_progress" | "completed" | "waiting";
+  conclusion?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  runner_name?: string | null;
+  labels?: string[];
+  html_url: string;
+};
+
+export type GitHubContentResponse = {
+  type: "file" | "dir" | "symlink" | "submodule";
+  encoding?: string;
+  content?: string;
+  name: string;
+  path: string;
+  sha: string;
+  size: number;
+  html_url?: string | null;
+};
+
+export type GitHubReferenceResponse = {
+  ref: string;
+  object: {
+    type: string;
+    sha: string;
+    url: string;
+  };
+};
+
+export type GitHubCommitResponse = {
+  sha: string;
+  html_url?: string;
+  tree: { sha: string };
+};
+
 export class GitHubApiError extends Error {
   status: number;
   details?: unknown;
@@ -1080,5 +1135,133 @@ export class GitHubApi {
       undefined,
       options,
     );
+  }
+
+  async listWorkflowRuns(
+    owner: string,
+    repo: string,
+    query: {
+      actor?: string;
+      branch?: string;
+      event?: string;
+      status?: string;
+      per_page: number;
+      page: number;
+    },
+    workflowId?: number | string,
+  ): Promise<{ total_count: number; workflow_runs: GitHubWorkflowRunResponse[] }> {
+    const workflowPath = workflowId === undefined
+      ? "actions/runs"
+      : `actions/workflows/${encodeURIComponent(String(workflowId))}/runs`;
+    return (await this.#request<{ total_count: number; workflow_runs: GitHubWorkflowRunResponse[] }>(
+      "GET",
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${workflowPath}`,
+      { query },
+    )).data;
+  }
+
+  async listWorkflowJobs(
+    owner: string,
+    repo: string,
+    runId: number,
+    query: { filter?: "latest" | "all"; per_page: number; page: number },
+  ): Promise<{ total_count: number; jobs: GitHubWorkflowJobResponse[] }> {
+    return (await this.#request<{ total_count: number; jobs: GitHubWorkflowJobResponse[] }>(
+      "GET",
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${runId}/jobs`,
+      { query },
+    )).data;
+  }
+
+  async downloadWorkflowJobLog(owner: string, repo: string, jobId: number): Promise<string> {
+    const token = await this.#getToken();
+    const response = await fetch(
+      `${API_BASE_URL}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/jobs/${jobId}/logs`,
+      {
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${token}`,
+          "User-Agent": USER_AGENT,
+          "X-GitHub-Api-Version": API_VERSION,
+        },
+        redirect: "follow",
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      },
+    );
+    if (!response.ok) {
+      const details = await parseBody(response);
+      throw new GitHubApiError(response.status, `Unable to download GitHub Actions job log (${response.status}).`, details);
+    }
+    return await response.text();
+  }
+
+  async getContent(
+    owner: string,
+    repo: string,
+    path: string,
+    ref: string,
+  ): Promise<GitHubContentResponse | GitHubContentResponse[]> {
+    return (await this.#request<GitHubContentResponse | GitHubContentResponse[]>(
+      "GET",
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path.split("/").map(encodeURIComponent).join("/")}`,
+      { query: { ref } },
+    )).data;
+  }
+
+  async getReference(owner: string, repo: string, ref: string): Promise<GitHubReferenceResponse> {
+    return (await this.#request<GitHubReferenceResponse>(
+      "GET",
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/${ref.split("/").map(encodeURIComponent).join("/")}`,
+    )).data;
+  }
+
+  async getGitCommit(owner: string, repo: string, sha: string): Promise<GitHubCommitResponse> {
+    return (await this.#request<GitHubCommitResponse>(
+      "GET",
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/commits/${encodeURIComponent(sha)}`,
+    )).data;
+  }
+
+  async createBlob(owner: string, repo: string, content: string): Promise<{ sha: string }> {
+    return (await this.#request<{ sha: string }>(
+      "POST",
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs`,
+      { body: { content, encoding: "utf-8" } },
+    )).data;
+  }
+
+  async createTree(
+    owner: string,
+    repo: string,
+    baseTree: string,
+    tree: Array<{ path: string; mode: "100644"; type: "blob"; sha: string | null }>,
+  ): Promise<{ sha: string }> {
+    return (await this.#request<{ sha: string }>(
+      "POST",
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees`,
+      { body: { base_tree: baseTree, tree } },
+    )).data;
+  }
+
+  async createCommit(
+    owner: string,
+    repo: string,
+    message: string,
+    tree: string,
+    parents: string[],
+  ): Promise<GitHubCommitResponse> {
+    return (await this.#request<GitHubCommitResponse>(
+      "POST",
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/commits`,
+      { body: { message, tree, parents } },
+    )).data;
+  }
+
+  async createReference(owner: string, repo: string, ref: string, sha: string): Promise<GitHubReferenceResponse> {
+    return (await this.#request<GitHubReferenceResponse>(
+      "POST",
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`,
+      { body: { ref, sha } },
+    )).data;
   }
 }

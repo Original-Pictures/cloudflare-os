@@ -3,6 +3,7 @@ import {
   GitHubApi,
   type GitHubIssueResponse,
 } from "../src/github-api";
+import { boundJobLog, validateCommitFilesOptions, validateRepoPath } from "../src/github-ci";
 import {
   assertIssueSearchResultsInRepo,
   buildIssueSearchQuery,
@@ -99,5 +100,123 @@ describe("GitHubApi.searchIssuesConditional", () => {
     );
 
     expect(requestUrl?.searchParams.get("advanced_search")).toBe("true");
+  });
+});
+
+describe("GitHub Actions API", () => {
+  it("lists failed runs for one workflow using bounded structured query parameters", async () => {
+    let requestUrl: URL | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      requestUrl = new URL(String(input));
+      return Response.json({ total_count: 0, workflow_runs: [] });
+    }));
+
+    const api = new GitHubApi(async () => "test-token");
+    await api.listWorkflowRuns("Original-Pictures", "DeutschtecAI", {
+      branch: "main",
+      event: "push",
+      status: "failure",
+      per_page: 30,
+      page: 1,
+    }, "unit-tests.yml");
+
+    expect(requestUrl?.pathname).toBe(
+      "/repos/Original-Pictures/DeutschtecAI/actions/workflows/unit-tests.yml/runs",
+    );
+    expect(requestUrl?.searchParams.get("status")).toBe("failure");
+    expect(requestUrl?.searchParams.get("branch")).toBe("main");
+    expect(requestUrl?.searchParams.get("event")).toBe("push");
+    expect(requestUrl?.searchParams.get("per_page")).toBe("30");
+  });
+
+  it("downloads an individual job log without exposing the bearer token in the URL", async () => {
+    let request: { url: URL; authorization: string | null } | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      request = {
+        url: new URL(String(input)),
+        authorization: headers.get("authorization"),
+      };
+      return new Response("failing assertion", { status: 200 });
+    }));
+
+    const api = new GitHubApi(async () => "secret-test-token");
+    await expect(api.downloadWorkflowJobLog("owner", "repo", 94404660070))
+      .resolves.toBe("failing assertion");
+    expect(request?.url.pathname).toBe("/repos/owner/repo/actions/jobs/94404660070/logs");
+    expect(request?.url.toString()).not.toContain("secret-test-token");
+    expect(request?.authorization).toBe("Bearer secret-test-token");
+  });
+});
+
+describe("GitHub repository content and atomic commits", () => {
+  it("encodes every repository path segment when reading content", async () => {
+    let requestUrl: URL | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      requestUrl = new URL(String(input));
+      return Response.json({
+        type: "file",
+        encoding: "base64",
+        content: "dGVzdA==",
+        name: "spec file.ts",
+        path: "src/spec file.ts",
+        sha: "a".repeat(40),
+        size: 4,
+      });
+    }));
+
+    const api = new GitHubApi(async () => "test-token");
+    await api.getContent("owner", "repo", "src/spec file.ts", "a".repeat(40));
+
+    expect(requestUrl?.pathname).toBe("/repos/owner/repo/contents/src/spec%20file.ts");
+    expect(requestUrl?.searchParams.get("ref")).toBe("a".repeat(40));
+  });
+
+  it("validates a bounded multi-file fix and blocks workflow modification", () => {
+    expect(validateCommitFilesOptions({
+      baseRef: "main",
+      expectedBaseSha: "a".repeat(40),
+      branch: "titan/ci-fix-123",
+      message: "Fix failing unit test",
+      files: [{ path: "src/example.ts", content: "export const fixed = true;\n" }],
+    })).toMatchObject({ branch: "titan/ci-fix-123" });
+
+    expect(() => validateCommitFilesOptions({
+      baseRef: "main",
+      expectedBaseSha: "a".repeat(40),
+      branch: "titan/ci-fix-123",
+      message: "Rewrite CI",
+      files: [{ path: ".github/workflows/ci.yml", content: "jobs: {}\n" }],
+    })).toThrow("cannot modify GitHub Actions workflow files");
+  });
+
+  it("rejects control characters in paths and bounds oversized job logs", () => {
+    expect(() => validateRepoPath("src/bad\npath.ts")).toThrow("relative paths");
+
+    const bounded = boundJobLog("x".repeat(600 * 1024));
+    expect(bounded.truncated).toBe(true);
+    expect(bounded.text).toContain("log bytes omitted by Titan");
+    expect(new TextEncoder().encode(bounded.text).byteLength).toBeLessThan(512 * 1024);
+  });
+
+  it("rejects stale or ambiguous commit inputs before queuing a write", () => {
+    expect(() => validateCommitFilesOptions({
+      baseRef: "main",
+      expectedBaseSha: "short-sha",
+      branch: "main",
+      message: "Fix",
+      files: [{ path: "src/example.ts", content: "fixed\n" }],
+    })).toThrow("fix branch must differ");
+
+    expect(() => validateCommitFilesOptions({
+      baseRef: "main",
+      expectedBaseSha: "a".repeat(40),
+      branch: "titan/fix",
+      message: "Fix",
+      files: [
+        { path: "src/example.ts", content: "one\n" },
+        { path: "src/example.ts", content: "two\n" },
+      ],
+    })).toThrow("duplicate path");
   });
 });

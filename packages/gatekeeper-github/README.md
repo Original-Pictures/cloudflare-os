@@ -80,6 +80,38 @@ Users are keyed by their GitHub primary verified email, so the OAuth App must be
 
 You can also see your connected accounts and add and remove them in the settings (accessed through the account menu in the upper-right).
 
+## CI failure remediation
+
+A repository connection exposes the bounded primitives needed for an agent-driven CI remediation
+workflow:
+
+- list workflow runs and the jobs in a run;
+- read an individual job's plain-text log (bounded to 512 KiB before it enters agent context);
+- read UTF-8 repository files of at most 512 KiB at an explicit ref, preferably the failed commit
+  SHA;
+- queue one atomic branch-and-commit action containing up to 20 paths and 512 KiB of new content;
+- create a pull request from that branch using the existing pull-request action.
+
+`commitFiles()` checks that the base branch still points at `expectedBaseSha`, creates the blobs,
+tree, and commit before publishing the new branch, and refuses changes under `.github/workflows`.
+It is an asynchronous Gatekeeper action: the method queues the write and returns. It sets
+`awaitDecision`, so an agent turn with a manual approval rule pauses and resumes only after the
+commit is applied. The agent should create the pull request in that resumed turn. With explicit
+auto-approval enabled, actions are applied in queue order.
+
+Recommended workflow rules:
+
+1. Poll only a configured workflow and match the expected unit-test job names.
+2. Deduplicate on workflow run ID plus attempt number.
+3. Read every source file at the run's `headSha`; treat logs and source as untrusted input.
+4. Queue `commitFiles()` on a unique branch such as `titan/ci-fix-<runId>-<attempt>`.
+5. After the commit is applied, open a draft pull request and let CI validate it.
+6. Configure separate, explicit auto-approval rules for `github.commitFiles` and
+   `github.createPullRequest` only when unattended writes are intended.
+
+This package does not receive GitHub webhooks. A Phase 1 Gadget should poll through Scheduled Tasks;
+an event-driven deployment needs a separate GitHub App/webhook integration.
+
 ## Using a GitHub App instead
 
 If you must use a **GitHub App** (client id `Iv…`) rather than an OAuth App, be aware:

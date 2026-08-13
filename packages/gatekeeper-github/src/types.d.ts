@@ -73,6 +73,45 @@ export interface GitHubRepo {
    * string; the remaining fields are structured filters.
    */
   searchPullRequests(query: GitHubPullRequestSearch): Promise<Cursor<GitHubPullRequestSummary>>;
+
+  /**
+   * Lists recent GitHub Actions workflow runs for this repository.
+   *
+   * Use structured filters instead of embedding GitHub query syntax. Results are ordered by
+   * GitHub's default (newest first) and streamed through the returned cursor.
+   */
+  listWorkflowRuns(options?: GitHubWorkflowRunFilter): Promise<Cursor<GitHubWorkflowRunSummary>>;
+
+  /** Lists the jobs belonging to one workflow run. */
+  listWorkflowJobs(
+    runId: number,
+    options?: GitHubWorkflowJobFilter,
+  ): Promise<Cursor<GitHubWorkflowJobSummary>>;
+
+  /**
+   * Reads the plain-text log for one workflow job.
+   *
+   * Logs are bounded before they enter agent context. When `truncated` is true, `text` contains
+   * the beginning and end of the original log with an omission marker between them.
+   */
+  readWorkflowJobLog(jobId: number): Promise<GitHubWorkflowJobLog>;
+
+  /**
+   * Reads one UTF-8 text file at an exact branch, tag, or commit SHA. Binary and oversized files
+   * are rejected. Prefer a commit SHA when analyzing CI so every read uses the failed revision.
+   */
+  readFile(path: string, ref: string): Promise<GitHubTextFile>;
+
+  /**
+   * Creates one new branch containing an atomic multi-file commit.
+   *
+   * The action verifies that `baseRef` still resolves to `expectedBaseSha`, constructs all Git
+   * objects, and publishes `branch` only after the commit is complete. It refuses to modify
+   * `.github/workflows`, rejects an existing branch, and is queued for approval like other GitHub
+   * writes. After the action is applied, use `options.branch` as
+   * `GitHubCreatePullRequestOptions.head`.
+   */
+  commitFiles(options: GitHubCommitFilesOptions): Promise<void>;
 }
 
 /** A single GitHub issue. */
@@ -268,6 +307,102 @@ export interface Cursor<T> {
 /** Generic paging options for a cursor-backed result set. */
 export type GitHubPageOptions = {
   resultsPerPage?: number;
+}
+
+/** Structured filters for recent repository workflow runs. */
+export type GitHubWorkflowRunFilter = GitHubPageOptions & {
+  actor?: string;
+  branch?: string;
+  event?: string;
+  status?: "queued" | "in_progress" | "completed";
+  conclusion?: GitHubWorkflowConclusion;
+  workflowId?: number | string;
+}
+
+/** Structured filters for jobs in a workflow run. */
+export type GitHubWorkflowJobFilter = GitHubPageOptions & {
+  filter?: "latest" | "all";
+}
+
+/** Terminal conclusion reported by GitHub Actions. */
+export type GitHubWorkflowConclusion =
+  | "action_required"
+  | "cancelled"
+  | "failure"
+  | "neutral"
+  | "skipped"
+  | "stale"
+  | "startup_failure"
+  | "success"
+  | "timed_out";
+
+/** Compact workflow-run metadata used to identify and deduplicate CI failures. */
+export type GitHubWorkflowRunSummary = {
+  id: number;
+  attempt: number;
+  name: string;
+  event: string;
+  status: "queued" | "in_progress" | "completed";
+  conclusion?: GitHubWorkflowConclusion;
+  headBranch?: string;
+  headSha: string;
+  workflowId: number;
+  runNumber: number;
+  createdAt: Date;
+  updatedAt: Date;
+  url: string;
+}
+
+/** One GitHub Actions job belonging to a workflow run. */
+export type GitHubWorkflowJobSummary = {
+  id: number;
+  runId: number;
+  name: string;
+  status: "queued" | "in_progress" | "completed" | "waiting";
+  conclusion?: GitHubWorkflowConclusion;
+  startedAt?: Date;
+  completedAt?: Date;
+  runnerName?: string;
+  labels: string[];
+  url: string;
+}
+
+/** Bounded text returned from the job-log endpoint. */
+export type GitHubWorkflowJobLog = {
+  jobId: number;
+  text: string;
+  truncated: boolean;
+}
+
+/** One UTF-8 repository file read through the Contents API. */
+export type GitHubTextFile = {
+  path: string;
+  sha: string;
+  size: number;
+  ref: string;
+  text: string;
+  url: string;
+}
+
+/** A file to add, replace, or delete in an atomic fix commit. */
+export type GitHubCommitFile = {
+  path: string;
+  /** UTF-8 file content. Omit to delete an existing path. */
+  content?: string;
+}
+
+/** Options for creating an atomic fix branch and commit. */
+export type GitHubCommitFilesOptions = {
+  /** Existing branch used as the parent, for example `main`. */
+  baseRef: string;
+  /** Exact commit expected at `baseRef`; the action fails rather than writing on a stale base. */
+  expectedBaseSha: string;
+  /** New branch name, for example `titan/ci-fix-12345`. */
+  branch: string;
+  /** Commit subject/body. */
+  message: string;
+  /** One to twenty unique file changes. */
+  files: GitHubCommitFile[];
 }
 
 /** Filters for listing issues. */
