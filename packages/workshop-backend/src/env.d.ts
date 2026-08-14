@@ -9,6 +9,10 @@ declare global {
       // Deployment-wide admin usernames.
       ADMINS?: string[];
 
+      // Source-controlled visual and editorial policy supplied by a deployment wrapper. Unlike
+      // admin-authored instance instructions, this baseline applies to every agent on every turn.
+      ORIGINAL_PICTURES_BRAND_GUIDELINES?: string;
+
       // Workers AI binding (injected by generate-wrangler-prod / run-dev-server; not in base wrangler.jsonc).
       WORKERS_AI: Ai;
 

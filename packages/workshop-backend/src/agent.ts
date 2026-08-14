@@ -320,6 +320,9 @@ export interface AgentHooks {
   // "" when none are set. Read on each turn so admin edits take effect promptly.
   getInstanceInstructions(): Promise<string>;
 
+  // Source-controlled deployment guidance, included in every regular and spawned-agent prompt.
+  getBrandGuidelines(): string | undefined;
+
   // Connection-request hooks for the agent.
   //
   // List the gatekeeper vendors the user could connect (id + display name). Used to populate the
@@ -557,6 +560,18 @@ export function formatSpawnerInstructions(instructions: string | undefined): str
       `every task you are given, in addition to the specific task described in the first message, ` +
       `unless they conflict with the user's safety or the instructions above.\n\n` +
       `<agent_instructions>\n${trimmed}\n</agent_instructions>`;
+}
+
+// Source-controlled deployment guidance has its own system-prompt block. It remains distinct
+// from mutable admin instructions so an operator can provide a durable organizational baseline.
+export function formatBrandGuidelines(instructions: string | undefined): string {
+  let trimmed = (instructions ?? "").trim();
+  if (!trimmed) return "";
+  return `# Brand guidelines\n\n` +
+      `Apply these guidelines by default when creating or materially changing user-facing apps, ` +
+      `Gadgets, documents, and artifacts. A user's explicit visual direction for a specific ` +
+      `artifact takes precedence.\n\n` +
+      `<brand_guidelines>\n${trimmed}\n</brand_guidelines>`;
 }
 
 let READ_FILE_TOOL_DESCRIPTION = `
@@ -2082,6 +2097,7 @@ export async function runAgent(
   // Deployment-wide admin instructions, appended to the static system slot (slot 0) so they stay
   // inside the Anthropic prompt cache window. "" when unset.
   let instanceInstructions = formatInstanceInstructions(await hooks.getInstanceInstructions());
+  let brandGuidelines = formatBrandGuidelines(hooks.getBrandGuidelines());
 
   // The two system prompt slots: the non-project-specific parts, followed by the
   // project-specific parts. Kept as a two-part construction (static slot first) so the shared
@@ -2115,6 +2131,7 @@ export async function runAgent(
     // spawner, so the prefix stays byte-stable across turns for prompt caching.
     let spawnerInstructions = formatSpawnerInstructions(agentContext.spawnerConfig.systemPrompt);
     let staticSlot = SPAWNER_SYSTEM_PROMPT;
+    if (brandGuidelines) staticSlot += `\n\n${brandGuidelines}`;
     if (instanceInstructions) staticSlot += `\n\n${instanceInstructions}`;
     if (spawnerInstructions) staticSlot += `\n\n${spawnerInstructions}`;
     systemPromptSlots = [
@@ -2223,9 +2240,7 @@ export async function runAgent(
 
     // Split the system prompt into static and dynamic parts for better caching.
     systemPromptSlots = [
-      instanceInstructions
-          ? `${SYSTEM_PROMPT}\n\n${instanceInstructions}`
-          : SYSTEM_PROMPT,
+      [SYSTEM_PROMPT, brandGuidelines, instanceInstructions].filter(Boolean).join("\n\n"),
       (standardFormats ? `${standardFormats}\n\n` : "") +
           `${systemPromptWorkspace}${systemPromptConnections}` +
           (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),

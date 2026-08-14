@@ -5606,6 +5606,10 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
+  getBrandGuidelines(): string | undefined {
+    return this.env.ORIGINAL_PICTURES_BRAND_GUIDELINES;
+  }
+
   async listConnectableVendors(): Promise<{id: string, displayName: string}[]> {
     try {
       let vendors = await this.#listGatekeeperVendorsCached();
